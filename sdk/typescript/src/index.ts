@@ -9,6 +9,8 @@
  */
 
 export * from "./errors.js";
+export * from "./transactions.js";
+</｜｜DSML｜｜ parameter>
 export {
   decodeGridPayError,
 } from "./errors.js";
