@@ -13,13 +13,35 @@
  */
 
 import React, {
-  useCallback,
   useId,
   useMemo,
   useReducer,
   useRef,
   useState,
 } from "react";
+
+import {
+  analyzeForwardGraph,
+  DEFAULT_MAX_FORWARD_DEPTH,
+  type ForwardAnalysis,
+  type ForwardEdge,
+} from "../../utils/forwardingLoopDetector.js";
+import {
+  calculateSettlement,
+  formatStroops,
+  usdcToStroops,
+} from "../../utils/settlement.js";
+import {
+  findDuplicateAddresses,
+  isValidStellarAddress,
+} from "../../utils/stellarAddress.js";
+import {
+  downloadSplitPreset,
+  parseSplitPreset,
+  serializeSplitPreset,
+  SPLIT_PRESET_SCHEMA,
+  type SplitPreset,
+} from "../../utils/splitPresets.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -29,6 +51,7 @@ const TOTAL_BPS = 10_000;
 const EXAMPLE_AMOUNT_USDC = 100;
 const DEFAULT_MAX_RECIPIENTS = 10;
 const DEFAULT_PROTOCOL_FEE_BPS = 50; // 0.50 %
+const EMPTY_FORWARD_CONFIGS: ForwardEdge[] = [];
 
 // ---------------------------------------------------------------------------
 // Types
@@ -45,6 +68,7 @@ export interface SplitRecipient {
 
 export interface ForwardingRule {
   id: string; // local UI key only
+  merchant: string;
   forward_to: string;
   forward_bps: number;
   active: boolean;
@@ -57,6 +81,14 @@ export interface SplitAllocationEditorProps {
   maxRecipients?: number;
   /** Protocol fee in bps shown in the flow diagram. Defaults to 50. */
   protocolFeeBps?: number;
+  /** Existing on-chain PaymentForwardConfig entries from get_forward_config. */
+  externalForwardConfigs?: ForwardEdge[];
+  /** Number of scheduled payouts that would be affected by forwarding changes. */
+  pendingPayoutCount?: number;
+  /** Contract MaxForwardDepth; defaults to 5. */
+  maxForwardDepth?: number;
+  /** Called after a preset has been imported and validated. */
+  onPresetApplied?: (preset: SplitPreset) => void;
   /** Called when the user confirms a valid configuration. */
   onSave?: (config: {
     recipients: Array<{ address: string; share_bps: number }>;
@@ -81,114 +113,6 @@ function pctToBps(pct: number): number {
 /** Converts basis points to a percentage rounded to 2 dp. */
 function bpsToPct(bps: number): number {
   return Math.round(bps) / 100;
-}
-
-/** Formats a bps value as a USDC amount out of EXAMPLE_AMOUNT_USDC. */
-function bpsToUsdc(bps: number, feeBps: number): string {
-  const afterFee = EXAMPLE_AMOUNT_USDC * (1 - feeBps / TOTAL_BPS);
-  return ((bps / TOTAL_BPS) * afterFee).toFixed(2);
-}
-
-/** Returns true if the address looks like a valid Stellar account ID. */
-function isValidStellarAddress(addr: string): boolean {
-  return /^[GC][A-Z2-7]{55}$/.test(addr.trim());
-}
-
-/** Finds all cycles in a forwarding-rule graph via DFS. Returns the first cycle as an ordered address array, or null. */
-function detectForwardingCycle(
-  rules: ForwardingRule[],
-  recipients: SplitRecipient[]
-): string[] | null {
-  // Build adjacency list: address -> forward_to
-  const edges: Record<string, string> = {};
-  for (const rule of rules) {
-    if (rule.active && rule.forward_to) {
-      // Map from each recipient to its forward_to target
-      for (const r of recipients) {
-        if (r.address && r.address === rule.forward_to) {
-          // This would be unusual — forwarding from recipient to another
-        }
-      }
-      // Treat each rule as merchant -> forward_to
-      edges[rule.forward_to] = rule.forward_to;
-    }
-  }
-
-  // Build a directed graph from all forwarding rules
-  const graph: Record<string, string[]> = {};
-  for (const rule of rules) {
-    if (!rule.forward_to) continue;
-    const src = rule.forward_to;
-    // For cycle detection we model: each forward_to can further forward
-    // We look for chains where any output of one rule feeds into another rule's forward_to
-    // Simple model: rule.forward_to -> any rule whose key matches
-    if (!graph[src]) graph[src] = [];
-  }
-
-  // Build a stricter graph: each forwarding rule is from (implicit merchant) to forward_to.
-  // Cycle = forward_to chain loops back to a previous node.
-  const fwdMap: Record<string, string> = {};
-  for (const rule of rules) {
-    if (rule.active && rule.forward_to) {
-      fwdMap[rule.id] = rule.forward_to;
-    }
-  }
-
-  // Build address-level graph
-  const addrGraph: Record<string, string[]> = {};
-  for (const rule of rules) {
-    if (!rule.active || !rule.forward_to) continue;
-    // We use forward_to as source as a simplified model
-    if (!addrGraph[rule.forward_to]) addrGraph[rule.forward_to] = [];
-  }
-
-  // A simple cycle check: build chain from each recipient through forwarding rules
-  const recipientAddresses = recipients.map((r) => r.address).filter(Boolean);
-
-  for (const startAddr of recipientAddresses) {
-    const visited: string[] = [];
-    let current = startAddr;
-    const seen = new Set<string>();
-
-    while (current) {
-      if (seen.has(current)) {
-        // Found a cycle — slice path from first occurrence
-        const cycleStart = visited.indexOf(current);
-        return [...visited.slice(cycleStart), current];
-      }
-      seen.add(current);
-      visited.push(current);
-
-      // Find a forwarding rule whose forward_to originates from this address
-      const nextRule = rules.find(
-        (r) => r.active && r.forward_to === current && r.forward_to !== current
-      );
-      // For a real implementation: match merchant address to current then follow forward_to
-      // Here we just check if any rule creates a loop on forward_to fields themselves
-      const selfLoop = rules.find(
-        (r) => r.active && r.forward_to === current && visited.length > 1
-      );
-      if (selfLoop && visited.length > 1) {
-        return [...visited, current];
-      }
-      break;
-    }
-  }
-
-  // Check pure forwarding-rule chains: if forward_to of one rule matches forward_to of another
-  const forwardAddresses = rules
-    .filter((r) => r.active)
-    .map((r) => r.forward_to)
-    .filter(Boolean);
-
-  const duplicateForward = forwardAddresses.filter(
-    (addr, i) => forwardAddresses.indexOf(addr) !== i
-  );
-  if (duplicateForward.length > 0) {
-    return duplicateForward;
-  }
-
-  return null;
 }
 
 /** Splits 10 000 bps evenly; remainder goes to dustSinkIndex (or last row). */
@@ -230,10 +154,12 @@ type EditorAction =
   | { type: "UPDATE_BPS"; id: string; bps: number }
   | { type: "SET_DUST_SINK"; id: string }
   | { type: "SPLIT_EVENLY" }
+  | { type: "AUTO_BALANCE" }
   | { type: "FILL_REMAINING"; id: string }
   | { type: "MOVE_ROW"; id: string; direction: "up" | "down" }
   | { type: "RESET" }
-  | { type: "ADD_FORWARD_RULE" }
+  | { type: "LOAD_PRESET"; preset: SplitPreset }
+  | { type: "ADD_FORWARD_RULE"; merchant: string }
   | { type: "REMOVE_FORWARD_RULE"; id: string }
   | { type: "UPDATE_FORWARD_RULE"; id: string; patch: Partial<ForwardingRule> };
 
@@ -247,9 +173,10 @@ function initialRecipient(overrides?: Partial<SplitRecipient>): SplitRecipient {
   };
 }
 
-function initialForwardingRule(): ForwardingRule {
+function initialForwardingRule(merchant: string): ForwardingRule {
   return {
     id: uid(),
+    merchant,
     forward_to: "",
     forward_bps: 0,
     active: true,
@@ -323,6 +250,32 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
       };
     }
 
+    case "AUTO_BALANCE": {
+      if (state.recipients.length === 0) return state;
+      const sinkIdx = state.recipients.findIndex((r) => r.isDustSink);
+      const effectiveSink = sinkIdx >= 0 ? sinkIdx : state.recipients.length - 1;
+      const sumOthers = (rows: SplitRecipient[]) =>
+        rows.reduce(
+          (sum, r, i) => (i === effectiveSink ? sum : sum + r.share_bps),
+          0
+        );
+
+      let rows = state.recipients.map((r) => ({ ...r }));
+      let excess = sumOthers(rows) - TOTAL_BPS;
+      for (let i = 0; i < rows.length && excess > 0; i += 1) {
+        if (i === effectiveSink) continue;
+        const reduction = Math.min(rows[i].share_bps, excess);
+        rows[i] = { ...rows[i], share_bps: rows[i].share_bps - reduction };
+        excess -= reduction;
+      }
+
+      rows[effectiveSink] = {
+        ...rows[effectiveSink],
+        share_bps: TOTAL_BPS - sumOthers(rows),
+      };
+      return { ...state, recipients: rows };
+    }
+
     case "FILL_REMAINING": {
       const others = state.recipients
         .filter((r) => r.id !== action.id)
@@ -353,10 +306,31 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
         recipients: [initialRecipient({ share_bps: TOTAL_BPS, isDustSink: true })],
       };
 
+    case "LOAD_PRESET": {
+      const hasSink = action.preset.recipients.some((r) => r.isDustSink);
+      const recipients = action.preset.recipients.map((r, i) => ({
+        id: uid(),
+        address: r.address,
+        share_bps: r.share_bps,
+        isDustSink: Boolean(r.isDustSink) || (!hasSink && i === action.preset.recipients.length - 1),
+      }));
+      const forwardingRules = action.preset.forwardingRules.map((r) => ({
+        id: uid(),
+        merchant: action.preset.merchantAddress ?? "",
+        forward_to: r.forward_to,
+        forward_bps: r.forward_bps,
+        active: r.active,
+      }));
+      return { ...state, recipients, forwardingRules };
+    }
+
     case "ADD_FORWARD_RULE":
       return {
         ...state,
-        forwardingRules: [...state.forwardingRules, initialForwardingRule()],
+        forwardingRules: [
+          ...state.forwardingRules,
+          initialForwardingRule(action.merchant),
+        ],
       };
 
     case "REMOVE_FORWARD_RULE":
@@ -666,6 +640,8 @@ function ForwardingRuleRow({
 }: ForwardingRuleRowProps) {
   const isInvalid =
     rule.forward_to.trim() !== "" && !isValidStellarAddress(rule.forward_to);
+  const isMerchantInvalid =
+    rule.merchant.trim() !== "" && !isValidStellarAddress(rule.merchant);
   const isZeroBps = rule.forward_bps === 0;
 
   const displayBps =
@@ -689,13 +665,37 @@ function ForwardingRuleRow({
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: "1fr 160px 60px auto",
+        gridTemplateColumns: "1fr 1fr 160px 60px auto",
         gap: 8,
         alignItems: "center",
         padding: "8px 0",
         borderBottom: "1px solid #f3f4f6",
       }}
     >
+      <div>
+        <input
+          type="text"
+          aria-label="Forwarding source merchant address"
+          placeholder="From G… or C…"
+          value={rule.merchant}
+          onChange={(e) => onChange(rule.id, { merchant: e.target.value })}
+          style={{
+            width: "100%",
+            padding: "6px 8px",
+            border: `1px solid ${isMerchantInvalid ? "#ef4444" : "#d1d5db"}`,
+            borderRadius: 4,
+            fontSize: 13,
+            fontFamily: "monospace",
+            boxSizing: "border-box",
+          }}
+        />
+        {isMerchantInvalid && (
+          <p role="alert" style={{ color: "#ef4444", fontSize: 11, margin: "2px 0 0" }}>
+            Invalid source address.
+          </p>
+        )}
+      </div>
+
       <div>
         <input
           type="text"
@@ -788,23 +788,29 @@ interface FlowPreviewProps {
   recipients: SplitRecipient[];
   forwardingRules: ForwardingRule[];
   protocolFeeBps: number;
-  cycleAddresses: string[] | null;
+  forwardAnalysis: ForwardAnalysis;
 }
 
 function FlowPreview({
   recipients,
   forwardingRules,
   protocolFeeBps,
-  cycleAddresses,
+  forwardAnalysis,
 }: FlowPreviewProps) {
-  const W = 580;
-  const H = Math.max(200, 60 + recipients.length * 60 + 40);
-
-  const afterFeeBps = TOTAL_BPS - protocolFeeBps;
-  const protocolFeeUsdc = (
-    (protocolFeeBps / TOTAL_BPS) *
-    EXAMPLE_AMOUNT_USDC
-  ).toFixed(2);
+  const settlement = useMemo(
+    () =>
+      calculateSettlement({
+        amountStroops: usdcToStroops(EXAMPLE_AMOUNT_USDC),
+        protocolFeeBps,
+        recipients,
+      }),
+    [recipients, protocolFeeBps]
+  );
+  const highlighted = useMemo(
+    () => new Set(forwardAnalysis.highlightedAddresses),
+    [forwardAnalysis]
+  );
+  const protocolFeeUsdc = formatStroops(settlement.protocolFeeStroops);
 
   const NODE_W = 130;
   const NODE_H = 32;
@@ -822,6 +828,10 @@ function FlowPreview({
   // Recipients spread vertically
   const recipientStartY = feeY + 20;
   const recipientGap = 52;
+
+  const chainStartY = recipientStartY + recipients.length * recipientGap + 8;
+  const W = 580;
+  const H = Math.max(200, chainStartY + forwardAnalysis.hopChains.length * 18 + 24);
 
   function truncAddr(addr: string) {
     if (!addr || addr.length < 10) return addr || "—";
@@ -888,12 +898,19 @@ function FlowPreview({
       {/* Arrows: fee node -> each recipient */}
       {recipients.map((r, i) => {
         const ry = recipientStartY + i * recipientGap;
-        const shareUsdc = bpsToUsdc(r.share_bps, protocolFeeBps);
-        const isCyclic = cycleAddresses?.includes(r.address);
+        const shareUsdc = formatStroops(settlement.payouts[i]?.netStroops ?? 0n);
+        const isProblem = highlighted.has(r.address.trim());
 
-        // Find forwarding rule for this recipient
+        // Find the forwarding rule that originates from this recipient
         const fwdRule = forwardingRules.find(
-          (f) => f.active && f.forward_to !== r.address
+          (f) =>
+            f.active &&
+            f.merchant.trim() === r.address.trim() &&
+            f.forward_to.trim() !== "" &&
+            f.forward_to.trim() !== r.address.trim()
+        );
+        const hopProblem = Boolean(
+          fwdRule && highlighted.has(fwdRule.forward_to.trim())
         );
 
         return (
@@ -904,9 +921,9 @@ function FlowPreview({
               y1={feeY + NODE_H / 2}
               x2={recipientX}
               y2={ry + NODE_H / 2}
-              stroke={isCyclic ? "#ef4444" : "#94a3b8"}
+              stroke={isProblem ? "#ef4444" : "#94a3b8"}
               strokeWidth={Math.max(1, (r.share_bps / TOTAL_BPS) * 8)}
-              strokeDasharray={isCyclic ? "4 2" : undefined}
+              strokeDasharray={isProblem ? "4 2" : undefined}
               markerEnd="url(#arrow)"
             />
 
@@ -921,8 +938,8 @@ function FlowPreview({
                 width={NODE_W}
                 height={NODE_H}
                 rx={4}
-                fill={isCyclic ? "#fee2e2" : "#dcfce7"}
-                stroke={isCyclic ? "#ef4444" : "#86efac"}
+                fill={isProblem ? "#fee2e2" : "#dcfce7"}
+                stroke={isProblem ? "#ef4444" : "#86efac"}
               />
               <text x={recipientX + 8} y={ry + 13} fontSize={10} fill="#166534" fontWeight="bold">
                 {truncAddr(r.address)}
@@ -931,9 +948,9 @@ function FlowPreview({
               <text x={recipientX + 8} y={ry + 25} fontSize={10} fill="#166534">
                 {r.share_bps} bps · {shareUsdc} USDC
               </text>
-              {isCyclic && (
+              {isProblem && (
                 <text x={recipientX + NODE_W - 40} y={ry + 20} fontSize={10} fill="#ef4444" fontWeight="bold">
-                  ⚠ LOOP
+                  ⚠ ISSUE
                 </text>
               )}
             </g>
@@ -946,30 +963,53 @@ function FlowPreview({
                   y1={ry + NODE_H / 2}
                   x2={forwardX}
                   y2={ry + NODE_H / 2}
-                  stroke="#a78bfa"
+                  stroke={hopProblem ? "#ef4444" : "#a78bfa"}
                   strokeWidth={1.5}
                   strokeDasharray="4 2"
                   markerEnd="url(#arrowPurple)"
                 />
-                <g tabIndex={0} aria-label={`Forward to ${truncAddr(fwdRule.forward_to)}: ${fwdRule.forward_bps} bps`}>
+                <g tabIndex={0} aria-label={`Forward to ${truncAddr(fwdRule.forward_to)}: ${fwdRule.forward_bps} bps${hopProblem ? " (loop risk)" : ""}`}>
                   <rect
                     x={forwardX}
                     y={ry}
                     width={NODE_W - 10}
                     height={NODE_H}
                     rx={4}
-                    fill="#ede9fe"
-                    stroke="#a78bfa"
+                    fill={hopProblem ? "#fee2e2" : "#ede9fe"}
+                    stroke={hopProblem ? "#ef4444" : "#a78bfa"}
                   />
-                  <text x={forwardX + 6} y={ry + 13} fontSize={9} fill="#5b21b6" fontWeight="bold">
-                    → {truncAddr(fwdRule.forward_to)}
+                  <text x={forwardX + 6} y={ry + 13} fontSize={9} fill={hopProblem ? "#991b1b" : "#5b21b6"} fontWeight="bold">
+                    {hopProblem ? "⚠ " : "→ "}{truncAddr(fwdRule.forward_to)}
                   </text>
-                  <text x={forwardX + 6} y={ry + 25} fontSize={9} fill="#5b21b6">
+                  <text x={forwardX + 6} y={ry + 25} fontSize={9} fill={hopProblem ? "#991b1b" : "#5b21b6"}>
                     {fwdRule.forward_bps} bps
                   </text>
                 </g>
               </>
             )}
+          </g>
+        );
+      })}
+
+      {/* Multi-hop forwarding chains */}
+      {forwardAnalysis.hopChains.map((chain, i) => {
+        const problem = chain.some((address) => highlighted.has(address));
+        return (
+          <g
+            key={`chain-${i}`}
+            tabIndex={0}
+            aria-label={`Forwarding chain: ${chain.join(" to ")}${problem ? " (invalid)" : ""}`}
+          >
+            <text
+              x={10}
+              y={chainStartY + i * 18}
+              fontSize={10}
+              fill={problem ? "#ef4444" : "#5b21b6"}
+              fontWeight={problem ? "bold" : "normal"}
+            >
+              {problem ? "⚠ " : "↳ "}
+              {chain.map(truncAddr).join(" → ")}
+            </text>
           </g>
         );
       })}
@@ -998,6 +1038,15 @@ function CompactTable({
   recipients: SplitRecipient[];
   protocolFeeBps: number;
 }) {
+  const settlement = useMemo(
+    () =>
+      calculateSettlement({
+        amountStroops: usdcToStroops(EXAMPLE_AMOUNT_USDC),
+        protocolFeeBps,
+        recipients,
+      }),
+    [recipients, protocolFeeBps]
+  );
   return (
     <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
       <thead>
@@ -1017,7 +1066,9 @@ function CompactTable({
             </td>
             <td style={tdStyle}>{r.share_bps}</td>
             <td style={tdStyle}>{bpsToPct(r.share_bps).toFixed(2)}%</td>
-            <td style={tdStyle}>{bpsToUsdc(r.share_bps, protocolFeeBps)}</td>
+            <td style={tdStyle}>
+              {formatStroops(settlement.payouts[i]?.netStroops ?? 0n)}
+            </td>
           </tr>
         ))}
       </tbody>
@@ -1044,11 +1095,19 @@ export function SplitAllocationEditor({
   merchantAddress,
   maxRecipients = DEFAULT_MAX_RECIPIENTS,
   protocolFeeBps = DEFAULT_PROTOCOL_FEE_BPS,
+  externalForwardConfigs = EMPTY_FORWARD_CONFIGS,
+  pendingPayoutCount = 0,
+  maxForwardDepth = DEFAULT_MAX_FORWARD_DEPTH,
+  onPresetApplied,
   onSave,
 }: SplitAllocationEditorProps) {
   const [state, dispatch] = useReducer(editorReducer, initialState);
   const [forwardingOpen, setForwardingOpen] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [presetName, setPresetName] = useState("");
+  const [presetError, setPresetError] = useState<string | null>(null);
+  const [presetNotice, setPresetNotice] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const formId = useId();
 
   const { recipients, forwardingRules, inputMode } = state;
@@ -1057,35 +1116,65 @@ export function SplitAllocationEditor({
   const totalBps = recipients.reduce((s, r) => s + r.share_bps, 0);
   const isExact = totalBps === TOTAL_BPS;
 
-  const addressCounts = recipients.reduce<Record<string, number>>((acc, r) => {
-    const a = r.address.trim();
-    if (a) acc[a] = (acc[a] ?? 0) + 1;
-    return acc;
-  }, {});
-  const duplicateAddresses = new Set(
-    Object.entries(addressCounts)
-      .filter(([, count]) => count > 1)
-      .map(([addr]) => addr)
+  const duplicateAddresses = useMemo(
+    () => findDuplicateAddresses(recipients.map((r) => r.address)),
+    [recipients]
   );
 
-  const cycleAddresses = useMemo(
-    () => detectForwardingCycle(forwardingRules, recipients),
-    [forwardingRules, recipients]
+  const forwardEdges = useMemo<ForwardEdge[]>(
+    () => [
+      ...externalForwardConfigs,
+      ...forwardingRules
+        .filter((r) => r.forward_to.trim() !== "")
+        .map((r) => ({
+          merchant: r.merchant.trim(),
+          forward_to: r.forward_to.trim(),
+          forward_bps: r.forward_bps,
+          active: r.active,
+        })),
+    ],
+    [externalForwardConfigs, forwardingRules]
+  );
+
+  const forwardAnalysis = useMemo(
+    () =>
+      analyzeForwardGraph({
+        edges: forwardEdges,
+        maxDepth: maxForwardDepth,
+      }),
+    [forwardEdges, maxForwardDepth]
+  );
+
+  const settlement = useMemo(
+    () =>
+      calculateSettlement({
+        amountStroops: usdcToStroops(EXAMPLE_AMOUNT_USDC),
+        protocolFeeBps,
+        recipients,
+      }),
+    [recipients, protocolFeeBps]
   );
 
   const hasInvalidAddresses = recipients.some(
     (r) => r.address.trim() !== "" && !isValidStellarAddress(r.address)
   );
   const hasForwardInvalid = forwardingRules.some(
-    (r) => r.forward_to.trim() !== "" && !isValidStellarAddress(r.forward_to)
+    (r) =>
+      (r.forward_to.trim() !== "" && !isValidStellarAddress(r.forward_to)) ||
+      (r.merchant.trim() !== "" && !isValidStellarAddress(r.merchant))
+  );
+  const hasIncompleteForward = forwardingRules.some(
+    (r) => r.forward_to.trim() === "" || r.merchant.trim() === ""
   );
 
   const canSave =
     isExact &&
+    recipients.length <= maxRecipients &&
     duplicateAddresses.size === 0 &&
     !hasInvalidAddresses &&
     !hasForwardInvalid &&
-    cycleAddresses === null &&
+    !hasIncompleteForward &&
+    forwardAnalysis.isValid &&
     recipients.every((r) => r.address.trim() !== "");
 
   function handleSave() {
@@ -1096,12 +1185,69 @@ export function SplitAllocationEditor({
         share_bps: r.share_bps,
       })),
       forwardingRules: forwardingRules.map((r) => ({
-        merchant: merchantAddress,
+        merchant: r.merchant.trim(),
         forward_to: r.forward_to.trim(),
         forward_bps: r.forward_bps,
         active: r.active,
       })),
     });
+  }
+
+  function buildPreset(): SplitPreset {
+    return {
+      schema: SPLIT_PRESET_SCHEMA,
+      name:
+        presetName.trim() ||
+        `split-preset-${new Date().toISOString().slice(0, 10)}`,
+      createdAt: new Date().toISOString(),
+      merchantAddress,
+      protocolFeeBps,
+      recipients: recipients.map((r) => ({
+        address: r.address.trim(),
+        share_bps: r.share_bps,
+        isDustSink: r.isDustSink,
+      })),
+      forwardingRules: forwardingRules.map((r) => ({
+        merchant: r.merchant.trim(),
+        forward_to: r.forward_to.trim(),
+        forward_bps: r.forward_bps,
+        active: r.active,
+      })),
+    };
+  }
+
+  function handleExportPreset() {
+    if (!canSave) return;
+    const preset = buildPreset();
+    downloadSplitPreset(preset);
+    setPresetError(null);
+    setPresetNotice(`Exported "${preset.name}" as JSON for team review.`);
+  }
+
+  function handleCopyPreset() {
+    if (!canSave) return;
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      void navigator.clipboard.writeText(serializeSplitPreset(buildPreset()));
+    }
+    setPresetError(null);
+    setPresetNotice("Preset JSON copied to clipboard.");
+  }
+
+  async function handleImportPreset(file: File | undefined) {
+    if (!file) return;
+    try {
+      const parsed = parseSplitPreset(await file.text(), maxRecipients);
+      dispatch({ type: "LOAD_PRESET", preset: parsed });
+      setPresetName(parsed.name);
+      setPresetError(null);
+      setPresetNotice(`Loaded preset "${parsed.name}". Review before saving.`);
+      onPresetApplied?.(parsed);
+    } catch (error) {
+      setPresetNotice(null);
+      setPresetError(
+        error instanceof Error ? error.message : "Unable to import preset"
+      );
+    }
   }
 
   function handleReset() {
@@ -1223,9 +1369,10 @@ export function SplitAllocationEditor({
             </div>
           )}
 
-          {/* Cycle error banner */}
-          {cycleAddresses && (
+          {/* Forwarding cycle error banner */}
+          {forwardAnalysis.cycles.map((cycle, index) => (
             <div
+              key={`cycle-${index}`}
               role="alert"
               style={{
                 background: "#fef2f2",
@@ -1238,15 +1385,84 @@ export function SplitAllocationEditor({
               }}
             >
               <strong>⚠ Cycle detected:</strong>{" "}
-              {cycleAddresses.map((a, i) => (
+              {cycle.map((a, i) => (
                 <span key={i}>
                   <code style={{ fontFamily: "monospace" }}>
                     {a.length > 10 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a}
                   </code>
-                  {i < cycleAddresses.length - 1 ? " → " : ""}
+                  {i < cycle.length - 1 ? " → " : ""}
                 </span>
               ))}{" "}
               forms a loop. Remove or redirect the highlighted forwarding rule.
+            </div>
+          ))}
+
+          {/* Hop-TTL breach banner */}
+          {forwardAnalysis.ttlBreaches.map((chain, index) => (
+            <div
+              key={`ttl-${index}`}
+              role="alert"
+              style={{
+                background: "#fff7ed",
+                border: "1px solid #fdba74",
+                borderRadius: 4,
+                padding: "8px 10px",
+                fontSize: 12,
+                color: "#9a3412",
+                marginBottom: 8,
+              }}
+            >
+              <strong>⚠ Hop limit exceeded:</strong> this forwarding chain is longer
+              than the {maxForwardDepth}-hop contract limit: {" "}
+              <code style={{ fontFamily: "monospace" }}>
+                {chain.map((a) => (a.length > 10 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a)).join(" → ")}
+              </code>
+            </div>
+          ))}
+
+          {/* Pending scheduled payouts warning */}
+          {pendingPayoutCount > 0 && (
+            <div
+              role="status"
+              style={{
+                background: "#eff6ff",
+                border: "1px solid #bfdbfe",
+                borderRadius: 4,
+                padding: "8px 10px",
+                fontSize: 12,
+                color: "#1e40af",
+                marginBottom: 8,
+              }}
+            >
+              <strong>Pending payouts:</strong> {pendingPayoutCount} scheduled
+              payout{pendingPayoutCount === 1 ? "" : "s"} are queued. Changing
+              forwarding targets may not affect already-scheduled transfers.
+            </div>
+          )}
+
+          {/* Sub-stroop dust rounding sink warning */}
+          {settlement.dustRemainderStroops > 0n && (
+            <div
+              role="status"
+              style={{
+                background: "#fffbeb",
+                border: "1px solid #fde68a",
+                borderRadius: 4,
+                padding: "8px 10px",
+                fontSize: 12,
+                color: "#92400e",
+                marginBottom: 8,
+              }}
+            >
+              <strong>Dust-rounding sink:</strong> integer division of the 10,000 bps
+              split leaves {settlement.dustRemainderStroops.toString()} sub-stroop
+              remainder stroop(s), assigned to{" "}
+              <code style={{ fontFamily: "monospace" }}>
+                {settlement.dustSinkAddress
+                  ? `${settlement.dustSinkAddress.slice(0, 6)}…${settlement.dustSinkAddress.slice(-4)}`
+                  : "—"}
+              </code>
+              .
             </div>
           )}
 
@@ -1271,6 +1487,19 @@ export function SplitAllocationEditor({
               style={toolbarBtn(false)}
             >
               Split Evenly
+            </button>
+            <button
+              type="button"
+              onClick={() => dispatch({ type: "AUTO_BALANCE" })}
+              disabled={isExact}
+              title={
+                isExact
+                  ? "Allocation already totals exactly 10,000 bps"
+                  : "Assign the remaining bps to the dust-sink recipient"
+              }
+              style={toolbarBtn(isExact)}
+            >
+              Auto-balance remainder
             </button>
             <button
               type="button"
@@ -1346,7 +1575,7 @@ export function SplitAllocationEditor({
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "1fr 160px 60px auto",
+                    gridTemplateColumns: "1fr 1fr 160px 60px auto",
                     gap: 8,
                     fontSize: 11,
                     color: "#6b7280",
@@ -1354,6 +1583,7 @@ export function SplitAllocationEditor({
                     borderBottom: "1px solid #e5e7eb",
                   }}
                 >
+                  <span>From (merchant)</span>
                   <span>Forward-to Address</span>
                   <span>Amount</span>
                   <span>Active</span>
@@ -1376,12 +1606,89 @@ export function SplitAllocationEditor({
 
                 <button
                   type="button"
-                  onClick={() => dispatch({ type: "ADD_FORWARD_RULE" })}
+                  onClick={() =>
+                    dispatch({ type: "ADD_FORWARD_RULE", merchant: merchantAddress })
+                  }
                   style={{ ...toolbarBtn(false), marginTop: 8 }}
                 >
                   + Add Forwarding Rule
                 </button>
               </div>
+            )}
+          </div>
+
+          {/* Reusable split presets */}
+          <div
+            style={{
+              marginTop: 20,
+              padding: 12,
+              border: "1px solid #e5e7eb",
+              borderRadius: 6,
+              background: "#fafafa",
+            }}
+          >
+            <h3 style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>
+              Reusable split preset
+            </h3>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <input
+                type="text"
+                aria-label="Preset name"
+                placeholder="Preset name (e.g. Q4 revenue share)"
+                value={presetName}
+                onChange={(e) => setPresetName(e.target.value)}
+                style={{
+                  flex: "1 1 200px",
+                  padding: "6px 8px",
+                  border: "1px solid #d1d5db",
+                  borderRadius: 4,
+                  fontSize: 12,
+                }}
+              />
+              <button
+                type="button"
+                onClick={handleExportPreset}
+                disabled={!canSave}
+                style={toolbarBtn(!canSave)}
+              >
+                Export JSON
+              </button>
+              <button
+                type="button"
+                onClick={handleCopyPreset}
+                disabled={!canSave}
+                style={toolbarBtn(!canSave)}
+              >
+                Copy JSON
+              </button>
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                style={toolbarBtn(false)}
+              >
+                Import JSON
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="application/json,.json"
+                aria-label="Import split preset JSON"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  void handleImportPreset(e.target.files?.[0]);
+                  e.target.value = "";
+                }}
+              />
+            </div>
+            {presetError && (
+              <p role="alert" style={{ color: "#dc2626", fontSize: 11, margin: "6px 0 0" }}>
+                {presetError}
+              </p>
+            )}
+            {presetNotice && (
+              <p role="status" style={{ color: "#166534", fontSize: 11, margin: "6px 0 0" }}>
+                {presetNotice}
+              </p>
             )}
           </div>
 
@@ -1435,7 +1742,7 @@ export function SplitAllocationEditor({
               recipients={recipients}
               forwardingRules={forwardingRules}
               protocolFeeBps={protocolFeeBps}
-              cycleAddresses={cycleAddresses}
+              forwardAnalysis={forwardAnalysis}
             />
           </div>
 
