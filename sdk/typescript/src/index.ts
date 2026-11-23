@@ -9,4 +9,9 @@
  */
 
 export * from "./errors.js";
+export {
+  decodeGridPayError,
+} from "./errors.js";
+export * from "./events.js";
+export * from "./transactions.js";
 export * from "./sandbox.js";
