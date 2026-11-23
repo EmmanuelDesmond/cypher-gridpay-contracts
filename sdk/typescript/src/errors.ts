@@ -9,6 +9,17 @@
 
 export type GridPayContractType = 'payment' | 'escrow' | 'refund' | 'admin';
 
+/**
+ * Contextual remediation action surfaced to the UI (e.g. a button in the
+ * TransactionReviewDrawer error remediation panel).
+ */
+export type GridPayErrorAction =
+  | 'restore-archived-entry'
+  | 'approve-token-allowance'
+  | 'retry-higher-fee'
+  | 'wait-rate-limit'
+  | 'contact-support';
+
 export interface GridPayErrorDescriptor {
   readonly code: number;
   readonly name: string;
@@ -18,6 +29,7 @@ export interface GridPayErrorDescriptor {
   readonly message: string;
   readonly resolution: string;
   readonly retryable: boolean;
+  readonly action: GridPayErrorAction;
 }
 
 export interface GridPayContractError {
@@ -29,14 +41,110 @@ export interface GridPayContractError {
   readonly message: string;
   readonly resolution: string;
   readonly retryable: boolean;
+  readonly action: GridPayErrorAction;
   readonly rawError?: unknown;
+}
+
+/**
+ * Derive the contextual remediation action for a descriptor.
+ *
+ * Explicit per-entry `action` values take precedence; this helper is used to
+ * fill in sensible defaults for the large generated error tables so that every
+ * entry carries an action without hand-editing each one.
+ */
+export function deriveErrorAction(
+  descriptor: Omit<GridPayErrorDescriptor, 'action'> & { action?: GridPayErrorAction }
+): GridPayErrorAction {
+  if (descriptor.action) {
+    return descriptor.action;
+  }
+
+  const name = descriptor.name;
+
+  // Archived-entry / TTL restoration
+  if (
+    name === 'NotFound' ||
+    name === 'Expired' ||
+    name === 'EscrowNotExpired' ||
+    name === 'EscrowAlreadyExpired' ||
+    name === 'RefundWindowExpired' ||
+    name === 'PolicyNotFound' ||
+    name === 'PolicyInactive' ||
+    name === 'TemplateNotFound' ||
+    name === 'TemplateInactive' ||
+    name === 'VoucherExpired' ||
+    name === 'PointsExpired' ||
+    name === 'ChannelExpired' ||
+    name === 'GracePeriodExpired' ||
+    name === 'TrialExpired' ||
+    name === 'ProposalExpired' ||
+    name === 'AppealWindowExpired' ||
+    name === 'EvidenceDeadlinePassed'
+  ) {
+    return 'restore-archived-entry';
+  }
+
+  // Token allowance / balance / authorization issues
+  if (
+    name === 'Unauthorized' ||
+    name === 'NotAnAdmin' ||
+    name === 'InsufficientFees' ||
+    name === 'InsufficientPoints' ||
+    name === 'InsufficientCollateral' ||
+    name === 'InsufficientTreasuryFees' ||
+    name === 'InsufficientArbitratorStake' ||
+    name === 'InsufficientAdmins' ||
+    name === 'InsufficientApprovals' ||
+    name === 'TransferFailed' ||
+    name === 'TokenNotAllowed' ||
+    name === 'UnsupportedRefundToken' ||
+    name === 'InvalidSignature' ||
+    name === 'InvalidMerkleProof' ||
+    name === 'InvalidNonce'
+  ) {
+    return 'approve-token-allowance';
+  }
+
+  // Rate limits, pauses, circuit breakers, transient conditions
+  if (
+    descriptor.retryable ||
+    name === 'RateLimitExceeded' ||
+    name === 'MerchantRateLimitExceeded' ||
+    name === 'AmountRateLimitExceeded' ||
+    name === 'RefundRateLimitExceeded' ||
+    name === 'CircuitBreakerTripped' ||
+    name === 'ContractPaused' ||
+    name === 'FunctionPaused' ||
+    name === 'MerchantPaused' ||
+    name === 'OracleFeedStale' ||
+    name === 'OracleCallFailed' ||
+    name === 'RefundCooldownActive' ||
+    name === 'RotationTimelockActive'
+  ) {
+    return 'wait-rate-limit';
+  }
+
+  return 'contact-support';
+}
+
+/**
+ * Normalize a raw descriptor table so every entry carries an `action`.
+ */
+function withActions(
+  table: ReadonlyArray<Omit<GridPayErrorDescriptor, 'action'> & { action?: GridPayErrorAction }>
+): ReadonlyMap<number, GridPayErrorDescriptor> {
+  const map = new Map<number, GridPayErrorDescriptor>();
+  for (const entry of table) {
+    map.set(entry.code, { ...entry, action: deriveErrorAction(entry) });
+  }
+  return map;
 }
 
 // ============================================================================
 // PAYMENT CONTRACT ERRORS
 // ============================================================================
 
-export const PAYMENT_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = new Map<number, GridPayErrorDescriptor>([
+export const PAYMENT_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = withActions([
   [100, {
     code: 100,
     name: "Unauthorized",
@@ -1243,7 +1351,7 @@ export const PAYMENT_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = new M
 // ESCROW CONTRACT ERRORS
 // ============================================================================
 
-export const ESCROW_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = new Map<number, GridPayErrorDescriptor>([
+export const ESCROW_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = withActions([
   [100, {
     code: 100,
     name: "Unauthorized",
@@ -1880,7 +1988,7 @@ export const ESCROW_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = new Ma
 // REFUND CONTRACT ERRORS
 // ============================================================================
 
-export const REFUND_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = new Map<number, GridPayErrorDescriptor>([
+export const REFUND_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = withActions([
   [1, {
     code: 1,
     name: "InvalidAmount",
@@ -2567,7 +2675,7 @@ export const REFUND_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = new Ma
 // ADMIN CONTRACT ERRORS
 // ============================================================================
 
-export const ADMIN_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = new Map<number, GridPayErrorDescriptor>([
+export const ADMIN_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = withActions([
   [1, {
     code: 1,
     name: "AlreadyInitialized",
@@ -2751,6 +2859,7 @@ export function decodeGridPayError(
     message: `Soroban contract reverted with unmapped error code ${code}.`,
     resolution: 'Consult contract source code or docs/ERROR_CODES.md for error resolution.',
     retryable: false,
+    action: 'contact-support',
     rawError,
   };
 }
@@ -2779,4 +2888,66 @@ export function formatDiagnosticError(error: unknown, targetContract?: GridPayCo
     return error instanceof Error ? error.message : String(error);
   }
   return `[${decoded.contract.toUpperCase()}::${decoded.name} (#${decoded.code})] ${decoded.message}\nRemediation: ${decoded.resolution}`;
+}
+
+// ============================================================================
+// DIAGNOSTIC REDACTION
+// ============================================================================
+
+/**
+ * Field names (case-insensitive) that must never leave the client when a user
+ * copies debug diagnostics for a support ticket.
+ */
+const SENSITIVE_FIELD_PATTERNS: ReadonlyArray<RegExp> = [
+  /memo/i,
+  /auth/i,
+  /signature/i,
+  /secret/i,
+  /private/i,
+  /seed/i,
+  /passphrase/i,
+  /token/i,
+  /api[_-]?key/i,
+  /authorization/i,
+  /credential/i,
+];
+
+const REDACTED = '[REDACTED]';
+
+function isSensitiveKey(key: string): boolean {
+  return SENSITIVE_FIELD_PATTERNS.some((pattern) => pattern.test(key));
+}
+
+/**
+ * Recursively strip sensitive memo/auth payload fields from a diagnostics
+ * object so it can be safely copied into a support ticket.
+ *
+ * Handles nested objects, arrays, and circular references. Non-object values
+ * are returned unchanged.
+ */
+export function redactDiagnostics<T>(payload: T): T {
+  const seen = new WeakSet<object>();
+
+  const walk = (value: unknown): unknown => {
+    if (value === null || typeof value !== 'object') {
+      return value;
+    }
+
+    if (seen.has(value as object)) {
+      return '[Circular]';
+    }
+    seen.add(value as object);
+
+    if (Array.isArray(value)) {
+      return value.map((item) => walk(item));
+    }
+
+    const result: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      result[key] = isSensitiveKey(key) ? REDACTED : walk(val);
+    }
+    return result;
+  };
+
+  return walk(payload) as T;
 }
