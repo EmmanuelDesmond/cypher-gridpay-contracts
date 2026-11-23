@@ -27,6 +27,13 @@ import React, {
 
 const REDUCED_MOTION_TICK_MS = 1500;
 
+/** Interval at which the interpolated value is reconciled with on-chain state. */
+const RECONCILE_INTERVAL_MS = 15_000;
+
+/** Fixed-point scale for BigInt interpolation (7 decimal places, Stellar stroop-like). */
+const FIXED_POINT_SCALE = 10_000_000n;
+const FIXED_POINT_SCALE_NUM = 10_000_000;
+
 /** Channel accent palette (color-blind safe Okabe-Ito). */
 const COLOR = {
   accent: '#0072B2', // claimed / safe / neutral
@@ -67,6 +74,30 @@ export interface LiveStreamCounterProps {
   claimed: number;
   /** Value accrued and claimable now (USDC) */
   accrued: number;
+  /**
+   * Ledger timestamp (ms since epoch) at which `accrued` was last observed
+   * on-chain. Used as the interpolation anchor. Defaults to mount time.
+   */
+  lastLedgerTimestamp?: number;
+  /**
+   * Optional explicit per-second rate (USDC). When omitted it is derived from
+   * `flowRateUsdcPerMin`. Prefer passing the on-chain rate for accuracy.
+   */
+  ratePerSecond?: number;
+  /**
+   * Maximum funded deposit (USDC) used to clamp interpolated display values.
+   * Defaults to `totalDeposit`.
+   */
+  depositCap?: number;
+  /**
+   * Called every 15s to fetch fresh on-chain state for reconciliation.
+   * Should resolve to the latest observed values.
+   */
+  onReconcile?: () => Promise<{
+    accrued: number;
+    claimed: number;
+    lastLedgerTimestamp: number;
+  }> | void;
   /** Current channel status */
   status?: ChannelStatus;
   /** Called with the top-up amount when a quick top-up pill is used */
@@ -170,50 +201,183 @@ function prefersReducedMotion(): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// BigInt fixed-point interpolation
+// ---------------------------------------------------------------------------
+
+/** Convert a USDC number to scaled BigInt fixed-point. */
+export function toFixedPoint(usdc: number): bigint {
+  if (!Number.isFinite(usdc) || usdc <= 0) return 0n;
+  return BigInt(Math.round(usdc * FIXED_POINT_SCALE_NUM));
+}
+
+/** Convert scaled BigInt fixed-point back to a USDC number. */
+export function fromFixedPoint(fp: bigint): number {
+  return Number(fp) / FIXED_POINT_SCALE_NUM;
+}
+
+/**
+ * Compute the interpolated accrued amount in scaled fixed-point.
+ *
+ * accrued = anchorAccrued + ratePerSecond * elapsedSeconds
+ * clamped to [0, depositCap].
+ *
+ * All arithmetic is BigInt to avoid floating-point drift on long streams.
+ */
+export function interpolateAccruedFixedPoint(params: {
+  anchorAccrued: number;
+  ratePerSecond: number;
+  elapsedMs: number;
+  depositCap: number;
+}): bigint {
+  const { anchorAccrued, ratePerSecond, elapsedMs, depositCap } = params;
+  const anchorFp = toFixedPoint(anchorAccrued);
+  const rateFp = toFixedPoint(ratePerSecond);
+  const capFp = toFixedPoint(depositCap);
+
+  if (elapsedMs <= 0 || rateFp <= 0n) {
+    return anchorFp > capFp ? capFp : anchorFp;
+  }
+
+  // elapsedMs is integer ms; multiply rate (per second) by ms then divide by 1000.
+  const elapsedMsBig = BigInt(Math.max(0, Math.floor(elapsedMs)));
+  const deltaFp = (rateFp * elapsedMsBig) / 1000n;
+  const raw = anchorFp + deltaFp;
+
+  if (raw < 0n) return 0n;
+  if (raw > capFp) return capFp;
+  return raw;
+}
+
+/** Clamp a scaled fixed-point value to [0, depositCap]. */
+export function clampToDeposit(valueFp: bigint, depositCap: number): bigint {
+  const capFp = toFixedPoint(depositCap);
+  if (valueFp < 0n) return 0n;
+  if (valueFp > capFp) return capFp;
+  return valueFp;
+}
+
+// ---------------------------------------------------------------------------
 // Live ticker hook
 // ---------------------------------------------------------------------------
 
 /**
  * Continuously advances the `accrued` value based on the flow rate.
- * Uses requestAnimationFrame when motion is allowed, and a 1.5s
- * setInterval when reduced motion is active.
+ *
+ * Interpolation is anchored to `(lastLedgerTimestamp, anchorAccrued)` and
+ * computed with BigInt fixed-point math, then clamped to `depositCap`.
+ *
+ * - Uses requestAnimationFrame when motion is allowed.
+ * - Uses a 1.5s setInterval when reduced motion is active.
+ * - Pauses the loop entirely when `document.visibilityState === 'hidden'`.
+ * - Reconciles with on-chain state every 15s via `onReconcile`.
  */
 function useLiveAccrual(
   baseAccrued: number,
-  flowRatePerMin: number,
+  ratePerSecond: number,
   status: ChannelStatus,
   reducedMotion: boolean,
+  depositCap: number,
+  lastLedgerTimestamp: number,
+  onReconcile?: LiveStreamCounterProps['onReconcile'],
 ): number {
   const [accrued, setAccrued] = useState(baseAccrued);
-  const lastTsRef = useRef<number | null>(null);
 
-  // Reset when the base value changes (e.g. after a top-up or claim)
+  // Anchor state — mutated by reconciliation and prop changes.
+  const anchorAccruedRef = useRef<number>(baseAccrued);
+  const anchorTsRef = useRef<number>(lastLedgerTimestamp);
+  const depositCapRef = useRef<number>(depositCap);
+  const rateRef = useRef<number>(ratePerSecond);
+  const onReconcileRef = useRef(onReconcile);
+
   useEffect(() => {
+    onReconcileRef.current = onReconcile;
+  }, [onReconcile]);
+
+  // Re-anchor when the on-chain base value / timestamp changes.
+  useEffect(() => {
+    anchorAccruedRef.current = baseAccrued;
+    anchorTsRef.current = lastLedgerTimestamp;
+    depositCapRef.current = depositCap;
+    rateRef.current = ratePerSecond;
     setAccrued(baseAccrued);
-    lastTsRef.current = null;
-  }, [baseAccrued]);
+  }, [baseAccrued, lastLedgerTimestamp, depositCap, ratePerSecond]);
 
+  // Visibility tracking — pause animation when tab is hidden.
+  const [hidden, setHidden] = useState<boolean>(
+    typeof document !== 'undefined' && document.visibilityState === 'hidden',
+  );
   useEffect(() => {
-    if (status !== 'live' || flowRatePerMin <= 0) return;
+    if (typeof document === 'undefined') return;
+    const handler = () => {
+      const isHidden = document.visibilityState === 'hidden';
+      setHidden(isHidden);
+      if (!isHidden) {
+        // Re-anchor to now so we don't "catch up" for the hidden period.
+        anchorAccruedRef.current = fromFixedPoint(
+          clampToDeposit(
+            interpolateAccruedFixedPoint({
+              anchorAccrued: anchorAccruedRef.current,
+              ratePerSecond: rateRef.current,
+              elapsedMs: Date.now() - anchorTsRef.current,
+              depositCap: depositCapRef.current,
+            }),
+            depositCapRef.current,
+          ),
+        );
+        anchorTsRef.current = Date.now();
+      }
+    };
+    document.addEventListener('visibilitychange', handler);
+    return () => document.removeEventListener('visibilitychange', handler);
+  }, []);
+
+  // Animation loop.
+  useEffect(() => {
+    if (status !== 'live' || ratePerSecond <= 0 || hidden) return;
+
+    const compute = () => {
+      const elapsedMs = Date.now() - anchorTsRef.current;
+      const fp = interpolateAccruedFixedPoint({
+        anchorAccrued: anchorAccruedRef.current,
+        ratePerSecond: rateRef.current,
+        elapsedMs,
+        depositCap: depositCapRef.current,
+      });
+      return fromFixedPoint(clampToDeposit(fp, depositCapRef.current));
+    };
 
     if (reducedMotion) {
       const id = setInterval(() => {
-        setAccrued((prev) => prev + (flowRatePerMin / 60) * (REDUCED_MOTION_TICK_MS / 1000));
+        setAccrued(compute());
       }, REDUCED_MOTION_TICK_MS);
       return () => clearInterval(id);
     }
 
     let raf = 0;
-    const step = (ts: number) => {
-      if (lastTsRef.current === null) lastTsRef.current = ts;
-      const dt = (ts - lastTsRef.current) / 1000; // seconds
-      lastTsRef.current = ts;
-      setAccrued((prev) => prev + (flowRatePerMin / 60) * dt);
+    const step = () => {
+      setAccrued(compute());
       raf = requestAnimationFrame(step);
     };
     raf = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf);
-  }, [flowRatePerMin, status, reducedMotion]);
+  }, [ratePerSecond, status, reducedMotion, hidden]);
+
+  // Reconcile with on-chain state every 15s.
+  useEffect(() => {
+    if (!onReconcileRef.current) return;
+    const id = setInterval(async () => {
+      try {
+        const next = await onReconcileRef.current?.();
+        if (!next) return;
+        anchorAccruedRef.current = next.accrued;
+        anchorTsRef.current = next.lastLedgerTimestamp;
+        setAccrued(next.accrued);
+      } catch {
+        // Reconciliation failures are non-fatal; keep interpolating.
+      }
+    }, RECONCILE_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, []);
 
   return accrued;
 }
@@ -962,6 +1126,10 @@ export function LiveStreamCounter({
   totalDeposit,
   claimed,
   accrued: accruedProp,
+  lastLedgerTimestamp,
+  ratePerSecond,
+  depositCap,
+  onReconcile,
   status = 'live',
   onTopUp,
   onMutualClose,
@@ -980,10 +1148,26 @@ export function LiveStreamCounter({
   }, []);
   const reducedMotion = forceReducedMotion ?? mqReduced;
 
-  // Live accrued value
-  const liveAccrued = useLiveAccrual(accruedProp, flowRateUsdcPerMin, status, reducedMotion);
+  // Resolve interpolation inputs.
+  const mountTsRef = useRef<number>(Date.now());
+  const anchorTs = lastLedgerTimestamp ?? mountTsRef.current;
+  const effectiveRatePerSecond =
+    ratePerSecond !== undefined ? ratePerSecond : flowRateUsdcPerMin / 60;
+  const effectiveDepositCap =
+    depositCap !== undefined ? depositCap : totalDeposit;
 
-  // Clamp accrued so it never exceeds remaining buffer
+  // Live accrued value (BigInt fixed-point interpolation, clamped to deposit cap)
+  const liveAccrued = useLiveAccrual(
+    accruedProp,
+    effectiveRatePerSecond,
+    status,
+    reducedMotion,
+    effectiveDepositCap,
+    anchorTs,
+    onReconcile,
+  );
+
+  // Clamp accrued so it never exceeds remaining buffer (min(accrued, deposit))
   const cappedAccrued = Math.min(liveAccrued, Math.max(0, totalDeposit - claimed));
   const remaining = Math.max(0, totalDeposit - claimed - cappedAccrued);
 
@@ -1116,3 +1300,16 @@ export function LiveStreamCounter({
 }
 
 export default LiveStreamCounter;
+
+// ---------------------------------------------------------------------------
+// Test-only exports (used by LiveStreamCounter.test.tsx)
+// ---------------------------------------------------------------------------
+
+export const __test__ = {
+  interpolateAccruedFixedPoint,
+  clampToDeposit,
+  toFixedPoint,
+  fromFixedPoint,
+  RECONCILE_INTERVAL_MS,
+  FIXED_POINT_SCALE_NUM,
+};

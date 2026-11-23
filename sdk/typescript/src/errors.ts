@@ -662,7 +662,7 @@ export const PAYMENT_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = withA
     enumName: "PaymentError",
     category: "Payment Lifecycle",
     message: "Token Not Allowed: TokenNotAllowed error in payment contract.",
-    resolution: "Check parameters and ensure contract prerequisites are satisfied for TokenNotAllowed.",
+    resolution: "The selected token is not whitelisted for this merchant. Choose a supported SEP-41 asset or ask the merchant to whitelist it.",
     retryable: false,
   }],
   [300, {
@@ -962,7 +962,7 @@ export const PAYMENT_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = withA
     enumName: "FeatureError",
     category: "Advanced Features / Escrow Bridge",
     message: "Insufficient Fees: InsufficientFees error in payment contract.",
-    resolution: "Adjust the amount or balance parameters to comply with configured caps.",
+    resolution: "The customer balance does not cover the amount plus protocol/merchant fees. Top up the token balance or reduce the amount.",
     retryable: false,
   }],
   [504, {
@@ -1172,7 +1172,7 @@ export const PAYMENT_ERRORS: ReadonlyMap<number, GridPayErrorDescriptor> = withA
     enumName: "FeatureError",
     category: "Advanced Features / Escrow Bridge",
     message: "Insufficient Points: InsufficientPoints error in payment contract.",
-    resolution: "Adjust the amount or balance parameters to comply with configured caps.",
+    resolution: "The loyalty point balance is too low for the requested redemption. Reduce the points applied or earn more points.",
     retryable: false,
   }],
   [524, {
@@ -2810,43 +2810,168 @@ export function extractErrorCode(raw: unknown): number | null {
 }
 
 /**
+ * Known non-contract failure signatures that the checkout widget must surface
+ * with actionable recovery instructions (insufficient balance, missing
+ * trustline / unwhitelisted token, rate limiting, expired session).
+ */
+interface KnownFailureSignature {
+  readonly name: string;
+  readonly category: string;
+  readonly message: string;
+  readonly resolution: string;
+  readonly retryable: boolean;
+  readonly pattern: RegExp;
+}
+
+const KNOWN_FAILURE_SIGNATURES: readonly KnownFailureSignature[] = [
+  {
+    name: 'InsufficientBalance',
+    category: 'Pre-flight / Balance',
+    message: 'Insufficient token balance to cover the payment amount and fees.',
+    resolution: 'Top up the customer token balance or reduce the payment amount before retrying.',
+    retryable: false,
+    pattern: /insufficient\s+(token\s+)?balance|balance\s+(is\s+)?too\s+low|underfunded/i,
+  },
+  {
+    name: 'TrustlineMissing',
+    category: 'Pre-flight / Trustline',
+    message: 'The customer account has no SEP-41 trustline for the selected token.',
+    resolution: 'Establish a trustline for the token in the customer wallet before retrying the payment.',
+    retryable: false,
+    pattern: /trustline|not\s+trusted|missing\s+trust|no\s+trust\s*line/i,
+  },
+  {
+    name: 'TokenNotWhitelisted',
+    category: 'Pre-flight / Token',
+    message: 'The selected token is not whitelisted for this merchant.',
+    resolution: 'Choose a supported SEP-41 asset or ask the merchant to whitelist the token.',
+    retryable: false,
+    pattern: /not\s+whitelisted|unwhitelisted|token\s+not\s+allowed|unsupported\s+token/i,
+  },
+  {
+    name: 'AllowanceExceeded',
+    category: 'Pre-flight / Allowance',
+    message: 'The SEP-41 allowance is insufficient for the requested transfer.',
+    resolution: 'Approve a larger allowance for the GridPay payment contract and retry.',
+    retryable: false,
+    pattern: /allowance|approve\s+amount|insufficient\s+allowance/i,
+  },
+  {
+    name: 'RateLimitReached',
+    category: 'Operational / Rate Limit',
+    message: 'A rate limit was reached while processing the payment.',
+    resolution: 'Wait for the rate limit window to reset before retrying the payment.',
+    retryable: true,
+    pattern: /rate\s*limit|too\s+many\s+requests|429/i,
+  },
+  {
+    name: 'SessionExpired',
+    category: 'Checkout / Session',
+    message: 'The checkout session has expired.',
+    resolution: 'Ask the merchant to create a new checkout session and retry.',
+    retryable: false,
+    pattern: /session\s+expired|checkout\s+expired|payment\s+expired/i,
+  },
+];
+
+function matchKnownFailure(rawError: unknown): KnownFailureSignature | null {
+  let text = '';
+  if (typeof rawError === 'string') {
+    text = rawError;
+  } else if (rawError instanceof Error) {
+    text = rawError.message;
+  } else if (rawError && typeof rawError === 'object') {
+    const obj = rawError as Record<string, unknown>;
+    const parts: string[] = [];
+    if (typeof obj['message'] === 'string') parts.push(obj['message']);
+    if (typeof obj['error'] === 'string') parts.push(obj['error']);
+    if (typeof obj['status'] === 'number') parts.push(String(obj['status']));
+    text = parts.join(' ');
+  }
+
+  if (!text) {
+    return null;
+  }
+
+  for (const signature of KNOWN_FAILURE_SIGNATURES) {
+    if (signature.pattern.test(text)) {
+      return signature;
+    }
+  }
+  return null;
+}
+
+/**
  * Decode any raw error from Soroban RPC simulation or transaction submission
  * into a strongly-typed GridPayContractError.
  *
+ * Handles contract reverts (numeric codes) as well as common non-contract
+ * failures surfaced by the checkout widget: insufficient balance, missing
+ * trustline / unwhitelisted token, allowance exhaustion, rate limiting, and
+ * expired sessions. Each result carries a category, human-readable message,
+ * remediation guidance, and a retryable flag.
+ *
  * @param rawError Any error object, RPC response, string, or code
  * @param targetContract Optional contract hint ('payment' | 'escrow' | 'refund' | 'admin')
- * @returns Decoded GridPayContractError or null if not a recognized contract error
+ * @returns Decoded GridPayContractError or null if not a recognized error
  */
 export function decodeGridPayError(
   rawError: unknown,
   targetContract?: GridPayContractType
 ): GridPayContractError | null {
   const code = extractErrorCode(rawError);
-  if (code === null) {
-    return null;
+  if (code !== null) {
+    // If contract hint provided, look up in that specific contract first
+    if (targetContract) {
+      const descriptor = ALL_CONTRACT_ERRORS.get(targetContract)?.get(code);
+      if (descriptor) {
+        return {
+          ...descriptor,
+          rawError,
+        };
+      }
+    }
+
+    // Look through contracts in standard priority order: payment -> escrow -> refund -> admin
+    const searchOrder: GridPayContractType[] = ['payment', 'escrow', 'refund', 'admin'];
+    for (const c of searchOrder) {
+      const descriptor = ALL_CONTRACT_ERRORS.get(c)?.get(code);
+      if (descriptor) {
+        return {
+          ...descriptor,
+          rawError,
+        };
+      }
+    }
+
+    // Generic fallback if numeric code is recognized as contract error pattern
+    return {
+      contract: targetContract ?? 'unknown',
+      code,
+      name: `UnknownContractError_${code}`,
+      enumName: 'Unknown',
+      category: 'Unmapped',
+      message: `Soroban contract reverted with unmapped error code ${code}.`,
+      resolution: 'Consult contract source code or docs/ERROR_CODES.md for error resolution.',
+      retryable: false,
+      rawError,
+    };
   }
 
-  // If contract hint provided, look up in that specific contract first
-  if (targetContract) {
-    const descriptor = ALL_CONTRACT_ERRORS.get(targetContract)?.get(code);
-    if (descriptor) {
-      return {
-        ...descriptor,
-        rawError,
-      };
-    }
-  }
-
-  // Look through contracts in standard priority order: payment -> escrow -> refund -> admin
-  const searchOrder: GridPayContractType[] = ['payment', 'escrow', 'refund', 'admin'];
-  for (const c of searchOrder) {
-    const descriptor = ALL_CONTRACT_ERRORS.get(c)?.get(code);
-    if (descriptor) {
-      return {
-        ...descriptor,
-        rawError,
-      };
-    }
+  // Non-contract failures (pre-flight checks, RPC/HTTP errors, wallet errors)
+  const signature = matchKnownFailure(rawError);
+  if (signature) {
+    return {
+      contract: targetContract ?? 'unknown',
+      code: -1,
+      name: signature.name,
+      enumName: 'ClientError',
+      category: signature.category,
+      message: signature.message,
+      resolution: signature.resolution,
+      retryable: signature.retryable,
+      rawError,
+    };
   }
 
   // Generic fallback if numeric code is recognized as contract error pattern
@@ -2862,6 +2987,7 @@ export function decodeGridPayError(
     action: 'contact-support',
     rawError,
   };
+  return null;
 }
 
 /**
@@ -2869,6 +2995,14 @@ export function decodeGridPayError(
  */
 export function isContractError(error: unknown): boolean {
   return extractErrorCode(error) !== null;
+}
+
+/**
+ * Determine if an unknown error is any recognized GridPay failure (contract
+ * revert or known client-side failure such as insufficient balance).
+ */
+export function isRecognizedGridPayError(error: unknown, targetContract?: GridPayContractType): boolean {
+  return decodeGridPayError(error, targetContract) !== null;
 }
 
 /**
