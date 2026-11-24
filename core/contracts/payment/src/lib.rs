@@ -129,6 +129,9 @@ pub enum FeatureKey {
     RelayerStipend(Address, Address),
     StreamingPaymentChannel(u64),
     StreamingPaymentChannelCounter,
+    PrepaidVault(u64),
+    PrepaidVaultCounter,
+    PrepaidLiability(Address),
 }
 
 #[derive(Clone)]
@@ -446,6 +449,16 @@ pub enum FeatureError {
     /// Structuring / smurfing detected: cumulative payment volume within the rolling window
     /// exceeds the large-payment threshold. Split the transaction or wait for the window to reset.
     StructuringDetected = 543,
+    /// Prepaid vault not found.
+    PrepaidVaultNotFound = 544,
+    /// Prepaid vault transfer is not allowed.
+    PrepaidVaultNotTransferable = 545,
+    /// Prepaid vault has insufficient balance.
+    PrepaidVaultInsufficientBalance = 546,
+    /// Prepaid vault is expired.
+    PrepaidVaultExpired = 547,
+    /// Prepaid vault merchant restriction mismatch.
+    PrepaidVaultMerchantMismatch = 548,
     /// Token lifecycle transition is invalid for the token's current status.
     InvalidTokenLifecycleTransition = 544,
     /// Token still has outstanding on-chain liabilities and cannot be removed.
@@ -499,6 +512,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
+            if code >= 500 && code <= 548 {
             if code >= 500 && code <= 547 {
                 return Ok(Error::Feature(unsafe { core::mem::transmute(code) }));
             }
@@ -1190,6 +1204,41 @@ pub struct ChannelSettled {
 pub struct ChannelExpiredClosed {
     pub channel_id: u64,
     pub refunded_to: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrepaidVaultDeposited {
+    pub vault_id: u64,
+    pub funder: Address,
+    pub beneficiary: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrepaidVaultSpent {
+    pub vault_id: u64,
+    pub owner: Address,
+    pub merchant: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrepaidVaultWithdrawn {
+    pub vault_id: u64,
+    pub owner: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrepaidVaultTransferred {
+    pub vault_id: u64,
+    pub from: Address,
+    pub to: Address,
 }
 
 #[contractevent]
@@ -2059,6 +2108,18 @@ pub struct FeeSweepRecord {
     pub token: Address,
     pub recipient: Address,
     pub swept_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PrepaidVault {
+    pub vault_id: u64,
+    pub owner: Address,
+    pub merchant: Option<Address>,
+    pub token: Address,
+    pub balance: i128,
+    pub expires_at: Option<u64>,
+    pub transferable: bool,
 }
 
 #[contracttype]
@@ -9607,6 +9668,28 @@ impl PaymentContract {
         if amount > accumulated {
             return Err(Error::Feature(FeatureError::InsufficientFees));
         }
+        let total_pending: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::TotalPendingSettlement(
+                fee_config.fee_token.clone(),
+            )))
+            .unwrap_or(0);
+        let prepaid_liability: i128 = storage::get_persistent(
+            &env,
+            &DataKey::Feature(FeatureKey::PrepaidLiability(fee_config.fee_token.clone())),
+        )
+        .unwrap_or(0);
+        let contract_balance = token::Client::new(&env, &fee_config.fee_token)
+            .balance(&env.current_contract_address());
+        let reserved = total_pending
+            .checked_add(prepaid_liability)
+            .ok_or(Error::Basic(BasicError::InvalidAmount))?;
+        let available = contract_balance.checked_sub(reserved).unwrap_or(0);
+        if amount > available {
+            return Err(Error::Feature(FeatureError::InsufficientBalanceForSweep));
+        }
+
         let token_client = token::Client::new(&env, &fee_config.fee_token);
         token_client.transfer(
             &env.current_contract_address(),
@@ -13453,6 +13536,248 @@ impl PaymentContract {
             .ok_or(Error::Feature(FeatureError::ChannelNotFound))
     }
 
+    // ── PREPAID VAULTS ──────────────────────────────────────────────────────
+
+    fn get_prepaid_vault_internal(env: &Env, vault_id: u64) -> Result<PrepaidVault, Error> {
+        storage::get_prepaid_vault(env, &storage::PrepaidVaultKey::Vault(vault_id))
+            .ok_or(Error::Feature(FeatureError::PrepaidVaultNotFound))
+    }
+
+    fn save_prepaid_vault_internal(env: &Env, vault: &PrepaidVault) {
+        storage::set_prepaid_vault(env, &storage::PrepaidVaultKey::Vault(vault.vault_id), vault);
+    }
+
+    /// Deposits funds into a prepaid vault for a beneficiary.
+    pub fn deposit_prepaid_vault(
+        env: Env,
+        funder: Address,
+        beneficiary: Address,
+        merchant_opt: Option<Address>,
+        token: Address,
+        amount: i128,
+        expires_at: Option<u64>,
+        transferable: bool,
+    ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env)
+            .map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
+        Self::require_not_paused(&env, "deposit_prepaid_vault")?;
+        funder.require_auth();
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        if let Some(ref merchant) = merchant_opt {
+            Self::require_merchant_not_paused(&env, merchant)?;
+            if Self::is_zero_address(&env, merchant) {
+                return Err(Error::Feature(FeatureError::InvalidCounterparty));
+            }
+        }
+        if let Some(exp) = expires_at {
+            if exp <= env.ledger().timestamp() {
+                return Err(Error::Feature(FeatureError::PrepaidVaultExpired));
+            }
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &funder,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let counter: u64 = storage::get_prepaid_vault(&env, &storage::PrepaidVaultKey::Counter).unwrap_or(0);
+        let vault_id = counter + 1;
+        let vault = PrepaidVault {
+            vault_id,
+            owner: beneficiary.clone(),
+            merchant: merchant_opt,
+            token: token.clone(),
+            balance: amount,
+            expires_at,
+            transferable,
+        };
+        Self::save_prepaid_vault_internal(&env, &vault);
+        storage::set_prepaid_vault(&env, &storage::PrepaidVaultKey::Counter, &vault_id);
+        let liab_key = DataKey::Feature(FeatureKey::PrepaidLiability(token.clone()));
+        let liab: i128 = storage::get_persistent(&env, &liab_key).unwrap_or(0);
+        storage::set_persistent(&env, &liab_key, &liab.checked_add(amount).ok_or(Error::Basic(BasicError::InvalidAmount))?);
+
+        (PrepaidVaultDeposited {
+            vault_id,
+            funder,
+            beneficiary,
+            token,
+            amount,
+        })
+        .publish(&env);
+        Ok(vault_id)
+    }
+
+    /// Pays a merchant from a prepaid vault.
+    ///
+    /// `payment_id_or_merchant` is treated as a merchant when it resolves to a vault
+    /// merchant restriction or when no payment id is found in storage.
+    pub fn pay_from_prepaid_vault(
+        env: Env,
+        owner: Address,
+        vault_id: u64,
+        payment_id_or_merchant: Address,
+        amount: i128,
+    ) -> Result<u64, Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env)
+            .map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
+        Self::require_not_paused(&env, "pay_from_prepaid_vault")?;
+        owner.require_auth();
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let mut vault = Self::get_prepaid_vault_internal(&env, vault_id)?;
+        if vault.owner != owner {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if let Some(exp) = vault.expires_at {
+            if env.ledger().timestamp() > exp {
+                return Err(Error::Feature(FeatureError::PrepaidVaultExpired));
+            }
+        }
+        if amount > vault.balance {
+            return Err(Error::Feature(FeatureError::PrepaidVaultInsufficientBalance));
+        }
+
+        let merchant = if let Some(ref m) = vault.merchant {
+            if *m != payment_id_or_merchant {
+                // Allow passing payment-related merchant only when it matches restriction.
+                // If a payment id is passed mistakenly as address, restriction still protects.
+                return Err(Error::Feature(FeatureError::PrepaidVaultMerchantMismatch));
+            }
+            m.clone()
+        } else {
+            // Open-loop vault: treat as merchant target directly.
+            payment_id_or_merchant.clone()
+        };
+        Self::require_merchant_not_paused(&env, &merchant)?;
+        if Self::is_zero_address(&env, &merchant) {
+            return Err(Error::Feature(FeatureError::InvalidCounterparty));
+        }
+
+        let new_balance = vault
+            .balance
+            .checked_sub(amount)
+            .ok_or(Error::Basic(BasicError::InvalidAmount))?;
+        token::Client::new(&env, &vault.token).transfer(
+            &env.current_contract_address(),
+            &merchant,
+            &amount,
+        );
+        vault.balance = new_balance;
+        Self::save_prepaid_vault_internal(&env, &vault);
+        let liab_key = DataKey::Feature(FeatureKey::PrepaidLiability(vault.token.clone()));
+        let liab: i128 = storage::get_persistent(&env, &liab_key).unwrap_or(0);
+        storage::set_persistent(&env, &liab_key, &liab.checked_sub(amount).ok_or(Error::Basic(BasicError::InvalidAmount))?);
+
+        (PrepaidVaultSpent {
+            vault_id,
+            owner,
+            merchant,
+            amount,
+        })
+        .publish(&env);
+        Ok(vault_id)
+    }
+
+    /// Withdraws unused funds from an open-loop or expired vault.
+    pub fn withdraw_unused_prepaid(
+        env: Env,
+        owner: Address,
+        vault_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env)
+            .map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
+        Self::require_not_paused(&env, "withdraw_unused_prepaid")?;
+        owner.require_auth();
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let mut vault = Self::get_prepaid_vault_internal(&env, vault_id)?;
+        if vault.owner != owner {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if amount > vault.balance {
+            return Err(Error::Feature(FeatureError::PrepaidVaultInsufficientBalance));
+        }
+        let expired = vault.expires_at.map(|e| env.ledger().timestamp() > e).unwrap_or(false);
+        if vault.merchant.is_some() && !expired {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let new_balance = vault
+            .balance
+            .checked_sub(amount)
+            .ok_or(Error::Basic(BasicError::InvalidAmount))?;
+        token::Client::new(&env, &vault.token).transfer(
+            &env.current_contract_address(),
+            &owner,
+            &amount,
+        );
+        vault.balance = new_balance;
+        Self::save_prepaid_vault_internal(&env, &vault);
+        let liab_key = DataKey::Feature(FeatureKey::PrepaidLiability(vault.token.clone()));
+        let liab: i128 = storage::get_persistent(&env, &liab_key).unwrap_or(0);
+        storage::set_persistent(&env, &liab_key, &liab.checked_sub(amount).ok_or(Error::Basic(BasicError::InvalidAmount))?);
+
+        (PrepaidVaultWithdrawn {
+            vault_id,
+            owner,
+            amount,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Transfers a transferable prepaid vault to a new owner.
+    pub fn transfer_prepaid_vault(
+        env: Env,
+        owner: Address,
+        vault_id: u64,
+        new_owner: Address,
+    ) -> Result<(), Error> {
+        let _entry = reentrancy::ExternalEntry::acquire(&env)
+            .map_err(|_| Error::Basic(BasicError::ReentrantCallDetected))?;
+        Self::require_not_paused(&env, "transfer_prepaid_vault")?;
+        owner.require_auth();
+
+        let mut vault = Self::get_prepaid_vault_internal(&env, vault_id)?;
+        if vault.owner != owner {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if !vault.transferable || vault.balance == 0 {
+            return Err(Error::Feature(FeatureError::PrepaidVaultNotTransferable));
+        }
+        if let Some(exp) = vault.expires_at {
+            if env.ledger().timestamp() > exp {
+                return Err(Error::Feature(FeatureError::PrepaidVaultExpired));
+            }
+        }
+
+        vault.owner = new_owner.clone();
+        Self::save_prepaid_vault_internal(&env, &vault);
+
+        (PrepaidVaultTransferred {
+            vault_id,
+            from: owner,
+            to: new_owner,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns a prepaid vault by id.
+    pub fn get_prepaid_vault(env: Env, vault_id: u64) -> Result<PrepaidVault, Error> {
+        storage::bump_prepaid_vault(&env, &storage::PrepaidVaultKey::Vault(vault_id));
+        Self::get_prepaid_vault_internal(&env, vault_id)
+    }
+
     /// Opens a time-streaming channel funded by the customer.
     pub fn open_streaming_channel(
         env: Env,
@@ -14189,7 +14514,29 @@ impl PaymentContract {
             .get(&DataKey::Config(ConfigKey::FeeConfig))
             .ok_or(Error::Feature(FeatureError::FeeConfigNotFound))?;
 
-        // Security check: Ensure sweep won't encroach on merchant pending settlements
+        // Security check: Ensure sweep won't encroach on merchant pending settlements or prepaid liabilities
+        let total_pending: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::TotalPendingSettlement(
+                fee_config.fee_token.clone(),
+            )))
+            .unwrap_or(0);
+        let prepaid_liability: i128 = storage::get_persistent(
+            &env,
+            &DataKey::Feature(FeatureKey::PrepaidLiability(fee_config.fee_token.clone())),
+        )
+        .unwrap_or(0);
+        let contract_balance = token::Client::new(&env, &fee_config.fee_token)
+            .balance(&env.current_contract_address());
+        let reserved = total_pending
+            .checked_add(prepaid_liability)
+            .ok_or(Error::Basic(BasicError::InvalidAmount))?;
+        let available = contract_balance.checked_sub(reserved).unwrap_or(0);
+        if sweep_amount > available {
+            return Err(Error::Feature(FeatureError::InsufficientBalanceForSweep));
+        }
+
         let token_client = token::Client::new(&env, &fee_config.fee_token);
         token_client.transfer(&env.current_contract_address(), &recipient, &sweep_amount);
         let remaining = accumulated - sweep_amount;
@@ -15363,6 +15710,8 @@ mod test_trial;
 mod test_issue_113_115_119_120;
 #[cfg(test)]
 mod test_metadata;
+#[cfg(test)]
+mod test_prepaid_vault;
 
 #[cfg(test)]
 mod test_payment_channel;
