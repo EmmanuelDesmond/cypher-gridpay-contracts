@@ -183,3 +183,34 @@ pub fn verify_archived_record_inclusion(
     }
     node == imt.root
 }
+
+// ============================================================================
+// PREPAID VAULT STORAGE
+// ============================================================================
+
+#[derive(Clone)]
+#[contracttype]
+pub enum PrepaidVaultKey {
+    Vault(u64),
+    Counter,
+}
+
+pub fn set_prepaid_vault<V>(env: &Env, key: &PrepaidVaultKey, value: &V)
+where
+    V: IntoVal<Env, Val>,
+{
+    set_persistent(env, key, value);
+}
+
+pub fn get_prepaid_vault<V>(env: &Env, key: &PrepaidVaultKey) -> Option<V>
+where
+    V: TryFromVal<Env, Val>,
+{
+    get_persistent(env, key)
+}
+
+pub fn bump_prepaid_vault(env: &Env, key: &PrepaidVaultKey) {
+    if has_persistent(env, key) {
+        extend_persistent(env, key);
+    }
+}

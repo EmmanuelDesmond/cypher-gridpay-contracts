@@ -570,6 +570,22 @@ pub struct MerchantRebateAccrual {
 }
 
 // ============================================================================
+// PREPAID VAULTS
+// ============================================================================
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PrepaidVault {
+    pub vault_id: u64,
+    pub owner: Address,
+    pub merchant: Option<Address>,
+    pub token: Address,
+    pub balance: i128,
+    pub expires_at: Option<u64>,
+    pub transferable: bool,
+}
+
+// ============================================================================
 // PAYMENT CHANNEL AND SPLITS
 // ============================================================================
 
