@@ -31,6 +31,15 @@ export interface QuotaGaugeProps {
   warningThreshold?: number;
   /** Circuit breaker threshold, default 1.0 */
   circuitBreakerThreshold?: number;
+  /**
+   * MerchantRefundQuota from `get_merchant_refund_summary` — the absolute
+   * refund amount (in the settlement token) the merchant is allowed per epoch.
+   * When provided alongside `refundAmount`, the gauge renders proximity to the
+   * quota in addition to the ratio thresholds.
+   */
+  merchantRefundQuota?: number;
+  /** Refund amount consumed this epoch (same token units as merchantRefundQuota). */
+  refundAmount?: number;
   /** Chart card identifier – used for localStorage view mode key */
   chartId: string;
   /** Pass true to show the error/retry state */
@@ -68,8 +77,24 @@ function formatPct(v: number): string {
 }
 
 function computeDeltaPct(current: number, previous?: number): number | null {
-  if (previous === undefined || previous === 0) return null;
+  // Zero-division safe: no previous value or a zero baseline yields no delta.
+  if (previous === undefined || previous === null || previous === 0) return null;
+  if (!Number.isFinite(current) || !Number.isFinite(previous)) return null;
   return ((current - previous) / previous) * 100;
+}
+
+/**
+ * Proximity to a quota expressed as a 0–1 ratio. Zero-division safe: a
+ * non-positive or non-finite quota yields null (no proximity to render).
+ */
+function computeQuotaProximity(amount?: number, quota?: number): number | null {
+  if (amount === undefined || quota === undefined) return null;
+  if (!Number.isFinite(amount) || !Number.isFinite(quota) || quota <= 0) return null;
+  return amount / quota;
+}
+
+function formatAmount(v: number): string {
+  return v.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
 function formatDeltaBadge(delta: number | null): string {
@@ -106,6 +131,8 @@ export function QuotaGauge({
   previousValue,
   warningThreshold = 0.75,
   circuitBreakerThreshold = 1.0,
+  merchantRefundQuota,
+  refundAmount,
   chartId,
   hasError = false,
   onRetry,
@@ -172,6 +199,16 @@ export function QuotaGauge({
   const fillColor = fillRatioFor(value, warningThreshold, circuitBreakerThreshold);
   const circuitBroken = value >= circuitBreakerThreshold;
   const isZero = value <= 0;
+
+  // MerchantRefundQuota proximity (from get_merchant_refund_summary)
+  const quotaProximity = computeQuotaProximity(refundAmount, merchantRefundQuota);
+  const hasQuota = quotaProximity !== null;
+  const quotaTripped = quotaProximity !== null && quotaProximity >= 1;
+  const quotaWarning = quotaProximity !== null && quotaProximity >= warningThreshold;
+  const quotaColor =
+    quotaProximity === null
+      ? COLOR_EMPTY
+      : fillRatioFor(quotaProximity, warningThreshold, circuitBreakerThreshold);
 
   // Threshold band positions (as percentages of full width)
   const warningLeftPct = warningThreshold * 100;
@@ -391,6 +428,59 @@ export function QuotaGauge({
               </div>
             </div>
 
+            {/* MerchantRefundQuota proximity */}
+            {hasQuota && (
+              <div
+                role="group"
+                aria-label={`Merchant refund quota proximity: ${formatPct(quotaProximity as number)} of ${formatAmount(merchantRefundQuota as number)} quota used.`}
+                style={{ marginTop: 16 }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'baseline',
+                    fontSize: 12,
+                    color: COLOR_AXIS,
+                    marginBottom: 6,
+                    fontVariantNumeric: 'tabular-nums',
+                  }}
+                >
+                  <span style={{ fontWeight: 600 }}>MerchantRefundQuota proximity</span>
+                  <span style={{ color: quotaColor, fontWeight: 600 }}>
+                    {formatAmount(refundAmount as number)} / {formatAmount(merchantRefundQuota as number)}
+                    {'  ·  '}
+                    {formatPct(quotaProximity as number)}
+                  </span>
+                </div>
+                <div
+                  style={{
+                    position: 'relative',
+                    height: 12,
+                    borderRadius: 4,
+                    background: '#EEF0F4',
+                    overflow: 'hidden',
+                  }}
+                  aria-hidden="true"
+                >
+                  <div
+                    style={{
+                      position: 'absolute',
+                      left: 0,
+                      top: 0,
+                      height: '100%',
+                      width: `${clampWidth(quotaProximity as number) * 100}%`,
+                      background: quotaColor,
+                      borderRadius: 4,
+                      transition: 'background 200ms ease-out',
+                    }}
+                  />
+                  <ThresholdLine leftPct={warningThreshold * 100} color={COLOR_WARNING} />
+                  <ThresholdLine leftPct={circuitBreakerThreshold * 100} color={COLOR_CIRCUIT_BREAK} />
+                </div>
+              </div>
+            )}
+
             {/* Circuit breaker tripped badge */}
             {circuitBroken && (
               <div
@@ -408,6 +498,26 @@ export function QuotaGauge({
                 }}
               >
                 ⚠ Circuit Breaker Tripped
+              </div>
+            )}
+
+            {/* Quota exceeded badge */}
+            {quotaTripped && (
+              <div
+                role="alert"
+                style={{
+                  marginTop: 8,
+                  padding: '6px 12px',
+                  background: 'rgba(213, 94, 0, 0.12)',
+                  border: `1px solid ${COLOR_CIRCUIT_BREAK}`,
+                  borderRadius: 4,
+                  fontSize: 13,
+                  fontWeight: 600,
+                  color: COLOR_CIRCUIT_BREAK,
+                  display: 'inline-block',
+                }}
+              >
+                ⚠ MerchantRefundQuota exceeded
               </div>
             )}
           </>
@@ -463,14 +573,46 @@ export function QuotaGauge({
                     {formatPct(circuitBreakerThreshold)}
                   </td>
                 </tr>
+                {hasQuota && (
+                  <>
+                    <tr style={{ borderBottom: '1px solid rgba(0,0,0,0.06)' }}>
+                      <th scope="row" style={thStyle}>MerchantRefundQuota</th>
+                      <td style={{ ...tdStyle, fontVariantNumeric: 'tabular-nums' }}>
+                        {formatAmount(merchantRefundQuota as number)}
+                      </td>
+                    </tr>
+                    <tr style={{ borderBottom: '1px solid rgba(0,0,0,0.06)' }}>
+                      <th scope="row" style={thStyle}>Refund amount used</th>
+                      <td style={{ ...tdStyle, fontVariantNumeric: 'tabular-nums' }}>
+                        {formatAmount(refundAmount as number)}
+                      </td>
+                    </tr>
+                    <tr style={{ borderBottom: '1px solid rgba(0,0,0,0.06)' }}>
+                      <th scope="row" style={thStyle}>Quota proximity</th>
+                      <td
+                        style={{
+                          ...tdStyle,
+                          fontVariantNumeric: 'tabular-nums',
+                          color: quotaColor,
+                        }}
+                      >
+                        {formatPct(quotaProximity as number)}
+                      </td>
+                    </tr>
+                  </>
+                )}
                 <tr>
                   <th scope="row" style={thStyle}>Status</th>
                   <td style={{ ...tdStyle, color: circuitBroken ? COLOR_CIRCUIT_BREAK : COLOR_AXIS }}>
                     {circuitBroken
                       ? '⚠ Circuit Breaker Tripped'
-                      : value >= warningThreshold
-                        ? 'Warning band'
-                        : 'Safe'}
+                      : quotaTripped
+                        ? '⚠ MerchantRefundQuota exceeded'
+                        : quotaWarning
+                          ? 'Warning band'
+                          : value >= warningThreshold
+                            ? 'Warning band'
+                            : 'Safe'}
                   </td>
                 </tr>
               </tbody>
