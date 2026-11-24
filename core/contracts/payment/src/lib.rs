@@ -64,6 +64,10 @@ pub enum ConfigKey {
     AllowedTokens,
     MaxForwardDepth,
     RelayerStipendBps,
+    TokenWhitelistShard(u32),
+    TokenWhitelistCount,
+    TokenLifecycle(Address),
+    TokenLiability(Address),
 }
 
 #[derive(Clone)]
@@ -442,6 +446,14 @@ pub enum FeatureError {
     /// Structuring / smurfing detected: cumulative payment volume within the rolling window
     /// exceeds the large-payment threshold. Split the transaction or wait for the window to reset.
     StructuringDetected = 543,
+    /// Token lifecycle transition is invalid for the token's current status.
+    InvalidTokenLifecycleTransition = 544,
+    /// Token still has outstanding on-chain liabilities and cannot be removed.
+    TokenStillHasLiabilities = 545,
+    /// Token removal or reactivation requires explicit multisig approval.
+    TokenLifecycleRequiresMultiSig = 546,
+    /// Insufficient or invalid multisig approvals supplied for a token lifecycle override.
+    InvalidTokenLifecycleApprovals = 547,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -487,7 +499,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 500 && code <= 543 {
+            if code >= 500 && code <= 547 {
                 return Ok(Error::Feature(unsafe { core::mem::transmute(code) }));
             }
             if code >= 400 && code <= 406 {
@@ -960,6 +972,26 @@ pub struct PaymentExpired {
     pub customer: Address,
     pub refunded_amount: i128,
     pub expired_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenDeprecated {
+    pub token: Address,
+    pub reason: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenRemoved {
+    pub token: Address,
+    pub forced: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenReactivated {
+    pub token: Address,
 }
 
 #[contractevent]
@@ -1596,6 +1628,14 @@ pub enum FeeTier {
     Standard,
     Premium,    // >= configured premium volume
     Enterprise, // >= configured enterprise volume
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum TokenLifecycleStatus {
+    Active,
+    DrainOnly,
+    Removed,
 }
 
 #[derive(Clone)]
@@ -3296,6 +3336,9 @@ impl PaymentContract {
         if scheduled_at <= now {
             return Err(Error::Payment(PaymentError::InvalidScheduleTime));
         }
+        if !Self::is_token_allowed(&env, &token) {
+            return Err(Error::Payment(PaymentError::TokenNotAllowed));
+        }
 
         let token_client = token::Client::new(&env, &token);
         let contract_address = env.current_contract_address();
@@ -3311,7 +3354,7 @@ impl PaymentContract {
             payment_id,
             customer: customer.clone(),
             merchant: merchant.clone(),
-            token,
+            token: token.clone(),
             amount,
             scheduled_at,
             executed: false,
@@ -3325,6 +3368,7 @@ impl PaymentContract {
             &DataKey::State(StateDataKey::ScheduledPaymentCounter),
             &payment_id,
         );
+        Self::increase_token_liability(&env, &token, amount);
 
         (PaymentCreated {
             payment_id,
@@ -3375,6 +3419,7 @@ impl PaymentContract {
             scheduled.token.clone(),
             scheduled.amount,
         )?;
+        Self::decrease_token_liability(&env, &scheduled.token, scheduled.amount);
         scheduled.executed = true;
         env.storage().instance().set(
             &DataKey::State(StateDataKey::ScheduledPayment(payment_id)),
@@ -3425,6 +3470,7 @@ impl PaymentContract {
         let token_client = token::Client::new(&env, &scheduled.token);
         let contract_address = env.current_contract_address();
         token_client.transfer(&contract_address, &scheduled.customer, &scheduled.amount);
+        Self::decrease_token_liability(&env, &scheduled.token, scheduled.amount);
         scheduled.cancelled = true;
         env.storage().instance().set(
             &DataKey::State(StateDataKey::ScheduledPayment(payment_id)),
@@ -3467,6 +3513,7 @@ impl PaymentContract {
                     &DataKey::Merchant(MerchantDataKey::PayoutSchedule(merchant.clone())),
                     &schedule,
                 );
+                Self::increase_token_liability(env, &token, amount);
                 return Ok(());
             }
         }
@@ -3571,6 +3618,7 @@ impl PaymentContract {
             &DataKey::Merchant(MerchantDataKey::PayoutSchedule(merchant.clone())),
             &schedule,
         );
+        Self::decrease_token_liability(&env, &schedule.token, payout_amount);
 
         // Interaction: External token transfer
         let token_client = token::Client::new(&env, &schedule.token);
@@ -3729,7 +3777,7 @@ impl PaymentContract {
             customer: customer.clone(),
             merchant: merchant.clone(),
             amount,
-            token,
+            token: token.clone(),
             currency,
             status: PaymentStatus::Pending,
             created_at: current_timestamp,
@@ -4004,6 +4052,7 @@ impl PaymentContract {
 
         // Funds are now held: storage must outlive the payment's deadline.
         Self::keep_payment_alive(&env, payment_id);
+        Self::increase_token_liability(env, &token, amount);
 
         Ok(payment_id)
     }
@@ -4738,6 +4787,7 @@ impl PaymentContract {
 
         // Update payment status to Cancelled
         payment.status = PaymentStatus::Cancelled;
+        Self::decrease_token_liability(&env, &payment.token, payment.amount);
 
         // Store updated payment back to storage
         env.storage()
@@ -4909,6 +4959,8 @@ impl PaymentContract {
         } else {
             payment.amount
         };
+
+        Self::decrease_token_liability(env, &payment.token, payment.amount);
 
         // Deduct platform fee (if configured) and get net amount for merchant
         let (net_amount, fee_amount) = PaymentContract::deduct_fee(
@@ -5850,6 +5902,7 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        Self::decrease_token_liability(env, &payment.token, payment.amount);
 
         // #557: return any installments the customer already paid toward this
         // still-Pending payment before it becomes Refunded. A payment with no
@@ -6059,6 +6112,7 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        Self::decrease_token_liability(env, &payment.token, payment.amount);
 
         // Update analytics
         let mut analytics: PaymentAnalytics = env
@@ -6274,24 +6328,12 @@ impl PaymentContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Adds a token to the list of allowed tokens for payments.
-    ///
-    /// # Arguments
-    /// * `admin` - The admin authorizing this change (must be in the multisig admin list)
-    /// * `token` - The SPL token address to add to the allowed list
-    ///
-    /// # Returns
-    /// `Ok(())` on success, or an error if the admin is unauthorized or multisig is not initialized.
     pub fn add_allowed_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_token_admin(&env, &admin)?;
 
-        let config: MultiSigConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
-            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
-        if !config.admins.contains(&admin) {
-            return Err(Error::Basic(BasicError::Unauthorized));
+        if Self::token_status(&env, &token) == TokenLifecycleStatus::Removed {
+            return Err(Error::Feature(FeatureError::TokenLifecycleRequiresMultiSig));
         }
 
         let mut tokens = Self::load_allowed_tokens(&env);
@@ -6299,60 +6341,203 @@ impl PaymentContract {
             tokens.push_back(token);
             Self::store_allowed_tokens(&env, &tokens);
         }
-
         Ok(())
     }
 
-    /// Removes a token from the list of allowed tokens for payments.
-    ///
-    /// # Arguments
-    /// * `admin` - The admin authorizing this change (must be in the multisig admin list)
-    /// * `token` - The SPL token address to remove from the allowed list
-    ///
-    /// # Returns
-    /// `Ok(())` on success, or an error if the admin is unauthorized or multisig is not initialized.
+    pub fn deprecate_allowed_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+        reason: String,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_token_admin(&env, &admin)?;
+
+        if Self::token_status(&env, &token) != TokenLifecycleStatus::Active {
+            return Err(Error::Feature(FeatureError::InvalidTokenLifecycleTransition));
+        }
+
+        Self::set_token_status(&env, &token, TokenLifecycleStatus::DrainOnly);
+        TokenDeprecated { token, reason }.publish(&env);
+        Ok(())
+    }
+
     pub fn remove_allowed_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_token_admin(&env, &admin)?;
 
+        let status = Self::token_status(&env, &token);
+        if status == TokenLifecycleStatus::Removed {
+            return Err(Error::Feature(FeatureError::InvalidTokenLifecycleTransition));
+        }
+        if Self::token_liability(&env, &token) > 0 {
+            return Err(Error::Feature(FeatureError::TokenStillHasLiabilities));
+        }
+
+        Self::set_token_status(&env, &token, TokenLifecycleStatus::Removed);
+        Self::remove_token_from_whitelist(&env, &token);
+        TokenRemoved { token, forced: false }.publish(&env);
+        Ok(())
+    }
+
+    pub fn force_remove_allowed_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+        approvers: Vec<Address>,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_lifecycle_approvals(&env, &admin, &approvers)?;
+
+        Self::set_token_status(&env, &token, TokenLifecycleStatus::Removed);
+        Self::remove_token_from_whitelist(&env, &token);
+        TokenRemoved { token, forced: true }.publish(&env);
+        Ok(())
+    }
+
+    pub fn reactivate_removed_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+        approvers: Vec<Address>,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_lifecycle_approvals(&env, &admin, &approvers)?;
+
+        if Self::token_status(&env, &token) != TokenLifecycleStatus::Removed {
+            return Err(Error::Feature(FeatureError::InvalidTokenLifecycleTransition));
+        }
+
+        Self::set_token_status(&env, &token, TokenLifecycleStatus::Active);
+        let mut tokens = Self::load_allowed_tokens(&env);
+        if !tokens.contains(&token) {
+            tokens.push_back(token.clone());
+            Self::store_allowed_tokens(&env, &tokens);
+        }
+        TokenReactivated { token }.publish(&env);
+        Ok(())
+    }
+
+    pub fn get_token_status(env: Env, token: Address) -> TokenLifecycleStatus {
+        Self::token_status(&env, &token)
+    }
+
+    fn token_status(env: &Env, token: &Address) -> TokenLifecycleStatus {
+        Self::stored_token_status(env, token).unwrap_or_else(|| {
+            let tokens = Self::load_allowed_tokens(env);
+            if tokens.is_empty() || tokens.contains(token) {
+                TokenLifecycleStatus::Active
+            } else {
+                TokenLifecycleStatus::Removed
+            }
+        })
+    }
+
+    pub fn get_allowed_tokens(env: Env) -> Vec<Address> {
+        let tokens = Self::load_allowed_tokens(&env);
+        let mut active = Vec::new(&env);
+        for token in tokens.iter() {
+            if Self::stored_token_status(&env, &token).unwrap_or(TokenLifecycleStatus::Active)
+                == TokenLifecycleStatus::Active
+            {
+                active.push_back(token);
+            }
+        }
+        active
+    }
+
+    fn require_token_admin(env: &Env, admin: &Address) -> Result<MultiSigConfig, Error> {
         let config: MultiSigConfig = env
             .storage()
             .instance()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
-        if !config.admins.contains(&admin) {
+        if !config.admins.contains(admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
+        Ok(config)
+    }
 
-        let tokens = Self::load_allowed_tokens(&env);
-        let mut updated = Vec::new(&env);
-        for entry in tokens.iter() {
-            if entry != token {
-                updated.push_back(entry);
+    fn require_lifecycle_approvals(
+        env: &Env,
+        admin: &Address,
+        approvers: &Vec<Address>,
+    ) -> Result<(), Error> {
+        let config = Self::require_token_admin(env, admin)?;
+        let mut unique: Vec<Address> = Vec::new(env);
+        for approver in approvers.iter() {
+            if !config.admins.contains(&approver) {
+                return Err(Error::Feature(FeatureError::InvalidTokenLifecycleApprovals));
+            }
+            approver.require_auth();
+            if !unique.contains(&approver) {
+                unique.push_back(approver);
             }
         }
-        Self::store_allowed_tokens(&env, &updated);
-
+        if unique.len() < config.required_signatures as u32 {
+            return Err(Error::Feature(FeatureError::InvalidTokenLifecycleApprovals));
+        }
         Ok(())
     }
 
-    /// Returns the list of allowed payment tokens.
-    ///
-    /// If no tokens have been configured, returns an empty list, which means all tokens are permitted.
-    ///
-    /// # Returns
-    /// A vector of token addresses that have been explicitly allowed by an admin.
-    /// Returns the list of all allowed tokens for payments.
-    ///
-    /// # Returns
-    /// A `Vec<Address>` of allowed token addresses. Returns an empty vector if none are configured.
-    pub fn get_allowed_tokens(env: Env) -> Vec<Address> {
-        Self::load_allowed_tokens(&env)
+    fn remove_token_from_whitelist(env: &Env, token: &Address) {
+        let tokens = Self::load_allowed_tokens(env);
+        let mut updated = Vec::new(env);
+        for entry in tokens.iter() {
+            if entry != *token {
+                updated.push_back(entry);
+            }
+        }
+        Self::store_allowed_tokens(env, &updated);
     }
 
-    /// The token whitelist. It lives in persistent shards
-    /// (`TokenWhitelistShard`) with only its length in instance storage, so
-    /// a long whitelist does not inflate every invocation. A contract not yet
-    /// migrated to schema 3 still has it under the legacy instance key.
+    fn stored_token_status(env: &Env, token: &Address) -> Option<TokenLifecycleStatus> {
+        storage::get_persistent(
+            env,
+            &DataKey::Config(ConfigKey::TokenLifecycle(token.clone())),
+        )
+    }
+
+    fn set_token_status(env: &Env, token: &Address, status: TokenLifecycleStatus) {
+        storage::set_persistent(
+            env,
+            &DataKey::Config(ConfigKey::TokenLifecycle(token.clone())),
+            &status,
+        );
+    }
+
+    fn token_liability(env: &Env, token: &Address) -> i128 {
+        storage::get_persistent(
+            env,
+            &DataKey::Config(ConfigKey::TokenLiability(token.clone())),
+        )
+        .unwrap_or(0)
+    }
+
+    fn increase_token_liability(env: &Env, token: &Address, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        let updated = Self::token_liability(env, token).saturating_add(amount);
+        storage::set_persistent(
+            env,
+            &DataKey::Config(ConfigKey::TokenLiability(token.clone())),
+            &updated,
+        );
+    }
+
+    fn decrease_token_liability(env: &Env, token: &Address, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        let updated = Self::token_liability(env, token).saturating_sub(amount);
+        storage::set_persistent(
+            env,
+            &DataKey::Config(ConfigKey::TokenLiability(token.clone())),
+            &updated,
+        );
+    }
+
     fn load_allowed_tokens(env: &Env) -> Vec<Address> {
         storage::read_sharded(
             env,
@@ -6367,8 +6552,6 @@ impl PaymentContract {
         .unwrap_or_else(|| Vec::new(env))
     }
 
-    /// Writes the token whitelist in sharded form and drops the legacy
-    /// instance copy.
     fn store_allowed_tokens(env: &Env, tokens: &Vec<Address>) {
         storage::write_sharded(
             env,
@@ -6381,13 +6564,8 @@ impl PaymentContract {
             .remove(&DataKey::Config(ConfigKey::AllowedTokens));
     }
 
-    // Mirrors the refund contract's token-registry bypass (Issue #191): an
-    // empty allowlist means the allowlist hasn't been configured yet, so all
-    // tokens are permitted until an admin opts in by calling
-    // `add_allowed_token`.
     fn is_token_allowed(env: &Env, token: &Address) -> bool {
-        let tokens = Self::load_allowed_tokens(env);
-        tokens.is_empty() || tokens.contains(token)
+        Self::token_status(env, token) == TokenLifecycleStatus::Active
     }
 
     const ACTIVE_SUBSCRIPTION_PAGE_SIZE: u64 = 100;
@@ -6737,6 +6915,9 @@ impl PaymentContract {
         if interval == 0 {
             // return Err(Error::InvalidInterval);
             return Err(Error::Basic(BasicError::InvalidInterval));
+        }
+        if !Self::is_token_allowed(&env, &token) {
+            return Err(Error::Payment(PaymentError::TokenNotAllowed));
         }
 
         let counter: u64 = env
@@ -9436,6 +9617,7 @@ impl PaymentContract {
             &DataKey::Payment(PaymentKey::AccumulatedFees),
             &(accumulated - amount),
         );
+        Self::decrease_token_liability(&env, &fee_config.fee_token, amount);
         (FeesWithdrawn {
             amount,
             treasury: fee_config.treasury.clone(),
@@ -9521,6 +9703,7 @@ impl PaymentContract {
             &DataKey::Payment(PaymentKey::AccumulatedFees),
             &(accumulated + fee),
         );
+        Self::increase_token_liability(env, token, fee);
 
         if risk_surcharge_bps > 0 {
             (RiskFeeApplied {

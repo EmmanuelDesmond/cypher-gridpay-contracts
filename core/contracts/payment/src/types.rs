@@ -94,6 +94,14 @@ pub enum FeeTier {
     Enterprise, // >= configured enterprise volume
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum TokenLifecycleStatus {
+    Active,
+    DrainOnly,
+    Removed,
+}
+
 // ============================================================================
 // TRIAL AND PAUSE DATA
 // ============================================================================
